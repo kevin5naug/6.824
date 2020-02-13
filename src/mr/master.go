@@ -83,7 +83,7 @@ func (m *Master) server() {
 func (m *Master) Done() bool {
 
 	// Your code here.
-	fmt.Println("entering done function")
+	//fmt.Println("entering done function")
 	ret := <-m.DoneCh
 
 	return ret
@@ -124,11 +124,15 @@ func (m *Master) CleanUp() {
 	defer m.Unlock()
 	//shutdown workers
 	for _, wid := range m.WorkerList {
+
+		//worker might already be dead, then dialing will get connection refuse
+
 		suc := callWorker(wid, "WorkerRPC.Shutdown", new(struct{}), new(struct{}))
 		if suc == false {
-			fmt.Println("Master cannot shutdown one worker")
+			fmt.Println("Master cannot shutdown one worker(worker might have crashed early)")
 		}
 	}
+	fmt.Println("shutting down master RPC server")
 	//shutdown master RPC
 	suc := CallMaster("Master.ShutDown", new(struct{}), new(struct{}))
 	if suc == false {
@@ -205,7 +209,8 @@ func callWorker(workerID string, rpcname string, args interface{}, reply interfa
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	c, err := rpc.Dial("unix", workerID)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		//worker might have crashed early
+		return false
 	}
 	defer c.Close()
 

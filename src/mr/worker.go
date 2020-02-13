@@ -137,10 +137,12 @@ func RunMapTask(taskID int, filePath string, R int, mapf func(string, string) []
 				//close the file and atomically rename it
 				newTempFile.Close()
 				os.Rename(newTempFile.Name(), partitionFileName)
+				//fmt.Println("file written and renamed")
 			}()
 			tempEncoderMap[partitionFileName] = json.NewEncoder(newTempFile)
 			tempEncoder = tempEncoderMap[partitionFileName]
 		}
+		//fmt.Println(res[i])
 		err := tempEncoder.Encode(&res[i])
 		if err != nil {
 			log.Fatal("Cannot write this key value pair: ", err)
@@ -156,8 +158,8 @@ func RunReduceTask(taskID int, M int, reducef func(string, []string) string){
 		targetFilePath := "mr-"+strconv.Itoa(i)+"-"+strconv.Itoa(taskID)
 		targetFile, err := os.Open(targetFilePath)
 		if err != nil {
+			//cannot use log.fatal here otherwise map/reduce parallel test fails?
 			fmt.Println("Fail to open this file")
-			return
 		}
 		defer targetFile.Close()
 		dec := json.NewDecoder(targetFile)
