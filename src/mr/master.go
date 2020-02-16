@@ -39,6 +39,7 @@ func (m *Master) MonitorAvailableWorkers(idleWorkerCh chan string) {
 	RegisteredWorkerCount := 0
 	for {
 		m.Lock()
+		//not sure if we can defer unlock here due to the use of cond.wait?
 		if len(m.WorkerList) > RegisteredWorkerCount {
 			idleWorker := m.WorkerList[RegisteredWorkerCount]
 			go func() { idleWorkerCh <- idleWorker }()
@@ -67,8 +68,9 @@ func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
-	os.Remove("mr-socket")
-	l, e := net.Listen("unix", "mr-socket")
+	sockname := masterSock()
+	os.Remove(sockname)
+	l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -207,7 +209,8 @@ func (m *Master) Schedule(TaskType string, idleWorkerCh chan string) {
 
 func callWorker(workerID string, rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	c, err := rpc.Dial("unix", workerID)
+	sockname := workerSock(workerID)
+	c, err := rpc.Dial("unix", sockname)
 	if err != nil {
 		//worker might have crashed early
 		return false

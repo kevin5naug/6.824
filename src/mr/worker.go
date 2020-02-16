@@ -55,8 +55,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	w := &WorkerRPC{ID: assignedID, Mapf: mapf, Reducef: reducef, DoneCh: make(chan bool), OtherCh: make(chan bool)}
 	wrpc := rpc.NewServer()
 	wrpc.Register(w)
-	os.Remove(assignedID)
-	l, err := net.Listen("unix", assignedID)
+	sockname := workerSock(assignedID)
+	os.Remove(sockname)
+	l, err := net.Listen("unix", sockname)
 	if err != nil {
 		log.Fatal("Fail to register the new Worker RPC server with the given worker, get error: ", err)
 	}
@@ -231,7 +232,8 @@ func CallExample() {
 //
 func CallMaster(rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	c, err := rpc.DialHTTP("unix", "mr-socket")
+	sockname := masterSock()
+	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}

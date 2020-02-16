@@ -6,6 +6,9 @@ package mr
 // remember to capitalize all names.
 //
 
+import "os"
+import "strconv"
+
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
@@ -41,4 +44,24 @@ type TaskArgs struct {
 	FilePath string //only has meaning if TaskType = "map"
 	R int //only has meaning if TaskType = "map"
 	M int //only has meaning if TaskType = "reduce"
+}
+
+// Cook up a unique-ish UNIX-domain socket name
+// in /var/tmp, for the master.
+// Can't use the current directory since
+// Athena AFS doesn't support UNIX-domain sockets.
+func masterSock() string {
+	s := "/var/tmp/824-mr-"
+	s += strconv.Itoa(os.Getuid())
+	return s
+}
+
+// Cook up a unique-ish UNIX-domain socket name
+// in /var/tmp, for the master.
+// Can't use the current directory since
+// Athena AFS doesn't support UNIX-domain sockets.
+func workerSock(workerID string) string {
+	s := "/var/tmp/824-mr-"
+	s += workerID
+	return s
 }
