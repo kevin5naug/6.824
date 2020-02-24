@@ -18,11 +18,12 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-	"bytes"
+
 	"../labgob"
 	"../labrpc"
 )
@@ -153,9 +154,9 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logList []LogEntry
-	if d.Decode(&currentTerm)!=nil || d.Decode(&votedFor)!=nil || d.Decode(&logList)!=nil {
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logList) != nil {
 		DPrintf("ERROR: Machine %d fails to read from persist data\n", rf.me)
-	}else{
+	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logList = logList
@@ -552,21 +553,23 @@ func (rf *Raft) advertiseLeaderStatus() {
 								}
 							}
 							if successCount > n/2 {
-								go rf.applyLogs(rf.matchIndex[peerID])
+								rf.commitIndex = rf.matchIndex[peerID]
+								go rf.applyLogs()
 							}
 						}
 					} else {
 						// appendEntry fails
-						if aereply.MatchIndex == -1 {
-							//no log in PrevLogTerm
-							curPreIndex := aeargs.PrevLogIndex - 1
-							for curPreIndex>= 0 && rf.logList[curPreIndex].Term >= aeargs.PrevLogTerm{
-								curPreIndex--
-							}
-							rf.nextIndex[peerID] = curPreIndex + 1
-						}else{
-							rf.nextIndex[peerID] = aereply.MatchIndex + 1
-						}
+						// if aereply.MatchIndex == -1 {
+						// 	//no log in PrevLogTerm
+						// 	curPreIndex := aeargs.PrevLogIndex - 1
+						// 	for curPreIndex >= 0 && rf.logList[curPreIndex].Term >= aeargs.PrevLogTerm {
+						// 		curPreIndex--
+						// 	}
+						// 	rf.nextIndex[peerID] = curPreIndex + 1
+						// } else {
+						// 	rf.nextIndex[peerID] = aereply.MatchIndex + 1
+						// }
+						rf.nextIndex[peerID] = aereply.MatchIndex + 1
 					}
 				}
 			}(i, aeargs)
@@ -592,7 +595,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.votedFor = -1
 	reply.Term = args.Term
 	if args.PrevLogIndex >= 0 && (len(rf.logList) <= args.PrevLogIndex || rf.logList[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		DPrintf("machine %d finds a prev log mismatch at term %d !\n", rf.me, rf.currentTerm)
+		DPrintf("APPENDENTRY: machine %d finds a prev log mismatch at term %d !\n", rf.me, rf.currentTerm)
 		DPrintf("PrevLogIndex: %d, len(rf.logList): %d\n", args.PrevLogIndex, len(rf.logList))
 		if len(rf.logList) > args.PrevLogIndex {
 			DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[args.PrevLogIndex].Term, args.Term)
@@ -615,21 +618,29 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 		reply.MatchIndex = matchIndex
 	} else if args.Entries != nil {
-		DPrintf("machine %d adding new logs at term %d !\n", rf.me, rf.currentTerm)
+		DPrintf("APPENDENTRY: machine %d adding new logs at term %d !\n", rf.me, rf.currentTerm)
 		//we can find the prevLog
 		rf.logList = rf.logList[:args.PrevLogIndex+1]
 		rf.logList = append(rf.logList, args.Entries...)
-		if args.LeaderCommit > rf.commitIndex && args.LeaderCommit < len(rf.logList) {
-			go rf.applyLogs(args.LeaderCommit)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = args.LeaderCommit
+			if args.LeaderCommit >= len(rf.logList) {
+				rf.commitIndex = len(rf.logList) - 1
+			}
+			go rf.applyLogs()
 		}
 		reply.Success = true
 		reply.MatchIndex = len(rf.logList) - 1
 		DPrintf("PrevLogIndex: %d, len(rf.logList): %d\n", args.PrevLogIndex, len(rf.logList))
 	} else {
-		DPrintf("machine %d receives a heart beat msg at term %d !\n", rf.me, rf.currentTerm)
+		DPrintf("APPENDENTRY: machine %d receives a heart beat msg at term %d !\n", rf.me, rf.currentTerm)
 		//heart beat
-		if args.LeaderCommit > rf.commitIndex && args.LeaderCommit < len(rf.logList) {
-			go rf.applyLogs(args.LeaderCommit)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = args.LeaderCommit
+			if args.LeaderCommit >= len(rf.logList) {
+				rf.commitIndex = len(rf.logList) - 1
+			}
+			go rf.applyLogs()
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex
@@ -641,17 +652,22 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 }
 
 //
-func (rf *Raft) applyLogs(leaderCommit int) {
+func (rf *Raft) applyLogs() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//sanity check
-	rf.commitIndex = leaderCommit
 	if rf.commitIndex > len(rf.logList)-1 {
 		rf.commitIndex = len(rf.logList) - 1
 	}
+	// for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+	// 	DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
+	// }
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		DPrintf("machine %d is committing log index %d at term %d !\n", rf.me, i, rf.currentTerm)
+		DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
 		rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.logList[i].Command, CommandValid: true}
 	}
-	rf.lastApplied = rf.commitIndex
+	//just make sure we are not going back, maybe not needed?
+	if rf.lastApplied < rf.commitIndex {
+		rf.lastApplied = rf.commitIndex
+	}
 }
