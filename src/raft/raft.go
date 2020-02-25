@@ -563,18 +563,21 @@ func (rf *Raft) advertiseLeaderStatus() {
 								}
 							}
 						} else {
-							// appendEntry fails
-							// if aereply.MatchIndex == -1 {
-							// 	//no log in PrevLogTerm
-							// 	curPreIndex := aeargs.PrevLogIndex - 1
-							// 	for curPreIndex >= 0 && rf.logList[curPreIndex].Term >= aeargs.PrevLogTerm {
-							// 		curPreIndex--
-							// 	}
-							// 	rf.nextIndex[peerID] = curPreIndex + 1
-							// } else {
-							// 	rf.nextIndex[peerID] = aereply.MatchIndex + 1
-							// }
-							rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							//appendEntry fails
+							if aereply.MatchIndex == -1 {
+								//no log in PrevLogTerm
+								curPreIndex := aeargs.PrevLogIndex - 1
+								if aeargs.PrevLogIndex <= -1 {
+									curPreIndex = -1
+								}
+								for curPreIndex >= 0 && rf.logList[curPreIndex].Term >= aeargs.PrevLogTerm {
+									curPreIndex--
+								}
+								rf.nextIndex[peerID] = curPreIndex + 1
+							} else {
+								rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							}
+							//rf.nextIndex[peerID] = aereply.MatchIndex + 1
 						}
 					} else {
 						//do nothing
