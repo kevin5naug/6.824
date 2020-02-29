@@ -626,6 +626,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			if rf.logList[matchIndex].Term == args.PrevLogTerm {
 				break
 			}
+			if rf.logList[matchIndex].Term < args.PrevLogTerm {
+				matchIndex = -1
+				break
+			}
 			matchIndex--
 		}
 		reply.Success = false
