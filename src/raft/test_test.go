@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -683,6 +685,11 @@ func TestPersist32C(t *testing.T) {
 // haven't been committed yet.
 //
 func TestFigure82C(t *testing.T) {
+	DPrintf("\n")
+	DPrintf("\n")
+	DPrintf("Test Figure 8 2C begins...\n")
+	DPrintf("\n")
+	DPrintf("\n")
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
