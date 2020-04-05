@@ -86,8 +86,43 @@ type Raft struct {
 	rng                       *rand.Rand
 	voteCount                 int
 	applyCh                   chan ApplyMsg
+
+	//lab3B
+	lastIncludedIndex int //volatile at the moment, might need to be persistent
+	lastIncludedTerm int
 }
 
+//realIdx: real index of the log
+//logIdx: current index in the logList
+//todo(might cause bugs here): make sure the following functions are executed with locks on raft instance
+func (rf *Raft) getLog(realIdx int) LogEntry {
+	return rf.logList[realIdx-rf.lastIncludedIndex-1];
+}
+
+func (rf *Raft) getRealIdx(logIdx int) int {
+	return logIdx+rf.lastIncludedIndex+1;
+}
+
+func (rf *Raft) getLogIdx(realIdx int) int {
+	return realIdx-rf.lastIncludedIndex-1;
+}
+
+func (rf *Raft) getLastRealIdx() int {
+	return len(rf.logList)-1+rf.lastIncludedIndex+1;
+}
+
+func (rf *Raft) getLastTerm() int {
+	if len(rf.logList)==0 {
+		return rf.lastIncludedTerm
+	}
+	return rf.logList[len(rf.logList)-1].Term
+}
+
+func (rf *Raft) getRealLogLength() int {
+	return rf.getLastRealIdx()+1
+}
+
+//
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -220,9 +255,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	isValidCandidate := true
-	if len(rf.logList) > 0 {
-		lastIdx := len(rf.logList) - 1
-		if args.LastLogTerm < rf.logList[lastIdx].Term || (args.LastLogTerm == rf.logList[lastIdx].Term && args.LastLogIndex < lastIdx) {
+	if rf.getRealLogLength() > 0 {
+		// lastIdx := len(rf.logList) - 1
+		// if args.LastLogTerm < rf.logList[lastIdx].Term || (args.LastLogTerm == rf.logList[lastIdx].Term && args.LastLogIndex < lastIdx) {
+		// 	isValidCandidate = false
+		// }
+		lastRealIdx := rf.getLastRealIdx()
+		lastRfLog := rf.getLog(lastRealIdx)
+		if args.LastLogTerm < lastRfLog.Term || (args.LastLogTerm == lastRfLog.Term && args.LastLogIndex < lastRealIdx){
 			isValidCandidate = false
 		}
 	}
@@ -327,7 +367,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("*************************************\n")
 	rf.logList = append(rf.logList, LogEntry{command, rf.currentTerm})
 	rf.persist()
-	index = len(rf.logList) //should we put -1 here???
+	//index = len(rf.logList) //should we put -1 here???
+	index = rf.getRealLogLength()
 	term = rf.currentTerm
 	return index, term, isLeader
 
@@ -413,6 +454,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.found_leader_or_candidate = false
 	rf.applyCh = applyCh
+	//initialize for lab3B
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = 0
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -459,8 +504,11 @@ func (rf *Raft) startElectionCampaign() {
 	rf.found_leader_or_candidate = true
 	n := len(rf.peers)
 	rvargs := &RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me, LastLogIndex: len(rf.logList) - 1}
-	if len(rf.logList) > 0 {
-		rvargs.LastLogTerm = rf.logList[len(rf.logList)-1].Term
+	// if len(rf.logList) > 0 {
+	// 	rvargs.LastLogTerm = rf.logList[len(rf.logList)-1].Term
+	// }
+	if rf.getRealLogLength() > 0 {
+		rvargs.LastLogTerm = rf.getLastTerm()
 	}
 	for i := 0; i < n; i++ {
 		if i == rf.me {
@@ -487,7 +535,8 @@ func (rf *Raft) startElectionCampaign() {
 								if peerID == rf.me {
 									continue
 								}
-								rf.nextIndex[peerID] = len(rf.logList)
+								//rf.nextIndex[peerID] = len(rf.logList)
+								rf.nextIndex[peerID] = rf.getRealLogLength()
 								rf.matchIndex[peerID] = -1
 							}
 							go rf.advertiseLeaderStatus()
@@ -514,77 +563,108 @@ func (rf *Raft) advertiseLeaderStatus() {
 			if i == rf.me {
 				continue
 			}
-			var aeargs AppendEntryArgs
-			aeargs.Term = rf.currentTerm
-			aeargs.LeaderID = rf.me
-			aeargs.PrevLogIndex = rf.nextIndex[i] - 1
-			if aeargs.PrevLogIndex >= 0 {
-				aeargs.PrevLogTerm = rf.logList[aeargs.PrevLogIndex].Term
-			}
-			if rf.nextIndex[i] < len(rf.logList) {
-				aeargs.Entries = rf.logList[rf.nextIndex[i]:]
+			snapshotNeeded := false
+			if rf.nextIndex[i] < rf.getRealLogLength() {
+				if rf.nextIndex[i] <= rf.lastIncludedIndex {
+					//send snapshot instead for this round of advertisement
+					snapshotNeeded = true
+				}else{
+					snapshotNeeded = false
+				}
 			} else {
-				aeargs.Entries = nil
+				snapshotNeeded = false
 			}
-			aeargs.LeaderCommit = rf.commitIndex
-			go func(peerID int, aeargs AppendEntryArgs) {
-				var aereply AppendEntryReply
-				ok := rf.sendAppendEntry(peerID, &aeargs, &aereply)
-				if ok {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if rf.state != "leader" {
-						return
-					}
-					if aereply.Term > rf.currentTerm {
-						rf.currentTerm = aereply.Term
-						rf.state = "follower"
-						rf.votedFor = -1
-						rf.persist()
-						return
-					} else if aereply.Term == rf.currentTerm {
-						if aereply.Success {
-							rf.nextIndex[peerID] = aereply.MatchIndex + 1
-							rf.matchIndex[peerID] = aereply.MatchIndex
-							if rf.commitIndex < rf.matchIndex[peerID] && rf.logList[rf.matchIndex[peerID]].Term == rf.currentTerm {
-								//only current term can commit by counting
-								successCount := 1
-								n := len(rf.peers)
-								for i := 0; i < n; i++ {
-									if i == rf.me {
-										continue
-									}
-									if rf.matchIndex[i] >= rf.matchIndex[peerID] {
-										successCount++
-									}
-								}
-								if successCount > n/2 {
-									rf.commitIndex = rf.matchIndex[peerID]
-									go rf.applyLogs()
-								}
-							}
-						} else {
-							//appendEntry fails
-							if aereply.MatchIndex == -1 {
-								//no log in PrevLogTerm
-								curPreIndex := aeargs.PrevLogIndex - 1
-								if aeargs.PrevLogIndex <= -1 {
-									curPreIndex = -1
-								}
-								for curPreIndex >= 0 && rf.logList[curPreIndex].Term >= aeargs.PrevLogTerm {
-									curPreIndex--
-								}
-								rf.nextIndex[peerID] = curPreIndex + 1
-							} else {
-								rf.nextIndex[peerID] = aereply.MatchIndex + 1
-							}
-							//rf.nextIndex[peerID] = aereply.MatchIndex + 1
-						}
-					} else {
-						//do nothing
+			if snapshotNeeded == false {
+				var aeargs AppendEntryArgs
+				aeargs.Term = rf.currentTerm
+				aeargs.LeaderID = rf.me
+				aeargs.PrevLogIndex = rf.nextIndex[i] - 1
+				if rf.nextIndex[i] < rf.getRealLogLength() {
+					// rf.nextIndex[i] > rf.lastIncludedIndex guaranteed
+					aeargs.Entries = rf.logList[rf.getLogIdx(rf.nextIndex[i]):]
+				} else {
+					aeargs.Entries = nil
+				}
+				//keep filling in AppendEntryArgs
+				if aeargs.PrevLogIndex >= 0 {
+					if(aeargs.PrevLogIndex <= rf.lastIncludedIndex){
+						aeargs.PrevLogTerm = rf.lastIncludedTerm
+					}else{
+						aeargs.PrevLogTerm = rf.getLog(aeargs.PrevLogIndex).Term
 					}
 				}
-			}(i, aeargs)
+				aeargs.LeaderCommit = rf.commitIndex
+				//send append entries
+				go func(peerID int, aeargs AppendEntryArgs) {
+					var aereply AppendEntryReply
+					ok := rf.sendAppendEntry(peerID, &aeargs, &aereply)
+					if ok {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						if rf.state != "leader" {
+							return
+						}
+						if aereply.Term > rf.currentTerm {
+							rf.currentTerm = aereply.Term
+							rf.state = "follower"
+							rf.votedFor = -1
+							rf.persist()
+							return
+						} else if aereply.Term == rf.currentTerm {
+							if aereply.Success {
+								rf.nextIndex[peerID] = aereply.MatchIndex + 1
+								rf.matchIndex[peerID] = aereply.MatchIndex
+								if rf.commitIndex < rf.matchIndex[peerID] && rf.getLog(rf.matchIndex[peerID]).Term == rf.currentTerm {
+									//only current term can commit by counting
+									//since it is guaranteed that matchIndex > commitIndex >= lastIncludedIndex(kv server state),
+									//we don't need to worry about rf.matchIndex[peerID] overflow
+									successCount := 1
+									n := len(rf.peers)
+									for i := 0; i < n; i++ {
+										if i == rf.me {
+											continue
+										}
+										if rf.matchIndex[i] >= rf.matchIndex[peerID] {
+											successCount++
+										}
+									}
+									if successCount > n/2 {
+										rf.commitIndex = rf.matchIndex[peerID]
+										go rf.applyLogs()
+									}
+								}
+							} else {
+								//appendEntry fails
+								if aereply.MatchIndex == -1 {
+									//no log in PrevLogTerm
+									if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
+										//need to send snapshot next time
+										rf.nextIndex[peerID] = rf.lastIncludedIndex - 1 //this will guarantee to trigger leader sending snapshot?
+									}else{
+										//aeargs.PrevLogIndex > rf.lastIncludedIndex >= -1
+										curPreIndex := aeargs.PrevLogIndex - 1
+										for curPreIndex > rf.lastIncludedIndex && rf.getLog(curPreIndex).Term >= aeargs.PrevLogTerm {
+											curPreIndex--
+										}
+										if curPreIndex <= rf.lastIncludedIndex {
+											rf.nextIndex[peerID] = rf.lastIncludedIndex + 1 //last chance
+										}else{
+											rf.nextIndex[peerID] = curPreIndex + 1;
+										}
+									}
+								} else {
+									rf.nextIndex[peerID] = aereply.MatchIndex + 1
+								}
+								//rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							}
+						} else {
+							//do nothing
+						}
+					}
+				}(i, aeargs)
+			}else{
+				//send snapshot instead
+			}
 		}
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(magicNumber) * time.Millisecond)
@@ -608,30 +688,56 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.state = "follower"
 	rf.found_leader_or_candidate = true
 	reply.Term = args.Term
-	if args.PrevLogIndex >= 0 && (len(rf.logList) <= args.PrevLogIndex || rf.logList[args.PrevLogIndex].Term != args.PrevLogTerm) {
+	if args.PrevLogIndex >= 0 && (rf.getRealLogLength() <= args.PrevLogIndex || (args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm) || rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm) {
+		//is it possible that args.PrevLogIndex < rf.lastIncludedIndex?
+		//we have args.PrevLogIndex >= leader.lastIncludedIndex >= rf.lastIncludedIndex guaranteed, 
+		//therefore if rf.getLog(args.PrevLogIndex) overflows, then args.PrevLogIndex == rf.lastIncludedIndex
 		DPrintf("APPENDENTRY: machine %d finds a prev log mismatch from leader machine %v at term %d !\n", rf.me, args.LeaderID, rf.currentTerm)
-		DPrintf("PrevLogIndex: %d, len(rf.logList): %d\n", args.PrevLogIndex, len(rf.logList))
-		if len(rf.logList) > args.PrevLogIndex {
-			DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[args.PrevLogIndex].Term, args.Term)
+		DPrintf("PrevLogIndex: %d, Log Real Length: %d\n", args.PrevLogIndex, rf.getRealLogLength())
+		if rf.getRealLogLength() > args.PrevLogIndex {
+			if (args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm) {
+				DPrintf("found args.PrevLogIndex == rf.lastIncludedIndex \n")
+				DPrintf("rf.lastIncludedIndex: %d, rf.lastIncludedTerm: %d \n", args.PrevLogTerm, rf.lastIncludedTerm)
+			}else{
+				DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[args.PrevLogIndex].Term, args.Term)
+			}
 		}
 		//we can't find prevLog
 		//heart beat message can reach here if:
 		// 1) a follower crashed and missed some logs
 		// 2) the follower becomes online again
-		matchIndex := len(rf.logList) - 1
+
+		matchIndex := rf.getRealLogLength() - 1
 		if matchIndex > args.PrevLogIndex {
 			matchIndex = args.PrevLogIndex
 		}
 		// find the first index it stores for that term
-		for matchIndex >= 0 {
-			if rf.logList[matchIndex].Term == args.PrevLogTerm {
+		for matchIndex > rf.lastIncludedIndex {
+			if rf.getLog(matchIndex).Term == args.PrevLogTerm {
 				break
 			}
-			if rf.logList[matchIndex].Term < args.PrevLogTerm {
+			if rf.getLog(matchIndex).Term < args.PrevLogTerm {
 				matchIndex = -1
 				break
 			}
 			matchIndex--
+		}
+		// If rf.getRealLogLength() <= args.PrevLogIndex
+		// 		either 1) matchIndex > rf.lastIncludeIndex -> we find the log with largest index not in snapshot that matches PrevLogTerm
+		//     		or 2) matchIndex = -1 -> we cannot find the log not in snapshot that matches PrevLogTerm, install snapshot is a safe option
+		//     		or 3) matchIndex == rf.lastIncludedIndex
+		//				-> either matchIndex log matches PrevLogTerm, or we cannot find the log not in snapshot that matches PrevLogTerm
+		//				-> install snapshot is a safe option, but can do better?
+		// If args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm
+		// 		we always have matchIndex = rf.lastIncludedIndex -> install snapshot is needed
+		// If args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm
+		// 		either 1) matchIndex > rf.lastIncludeIndex -> we find the log with largest index not in snapshot that matches PrevLogTerm
+		//     		or 2) matchIndex = -1 -> we cannot find the log not in snapshot that matches PrevLogTerm, install snapshot is a safe option
+		//     		or 3) matchIndex == rf.lastIncludedIndex 
+		//				-> either matchIndex log matches PrevLogTerm, or we cannot find the log not in snapshot that matches PrevLogTerm
+		//				-> install snapshot is a safe option, but can do better?
+		if matchIndex == rf.lastIncludedIndex {
+			matchIndex = -1 //just let leader send the snapshot to us
 		}
 		reply.Success = false
 		reply.MatchIndex = matchIndex
@@ -641,14 +747,18 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		//should not truncate the log !!!
 		n := len(args.Entries)
 		for i := 1; i <= n; i++ {
-			if args.PrevLogIndex+i < len(rf.logList) && rf.logList[args.PrevLogIndex+i].Term != args.Entries[i-1].Term {
-				rf.logList = rf.logList[:args.PrevLogIndex+i] //truncate the log
-				break                                         //all following logs deleted, no need to loop anymore
+			//we are guaranteed that args.PrevLogIndex >= leader.lastIncludedIndex >= rf.lastIncludedIndex
+			//therefore if rf.getLog(args.PrevLogIndex+i) overflows, then i=0 and args.PrevLogIndex == rf.lastIncludedIndex
+			//but here i>0, so won't overflow
+			if args.PrevLogIndex+i < rf.getRealLogLength() && (rf.getLog(args.PrevLogIndex+i).Term != args.Entries[i-1].Term) {
+				//existing entry conflicts with a new one
+				rf.logList = rf.logList[:rf.getLogIdx(args.PrevLogIndex+i)] //truncate the log
+				break 					//all following logs deleted, no need to loop anymore
 			}
 		}
 		for i := 1; i <= n; i++ {
-			if args.PrevLogIndex+i < len(rf.logList) {
-				rf.logList[args.PrevLogIndex+i] = args.Entries[i-1]
+			if args.PrevLogIndex+i < rf.getRealLogLength() {
+				rf.logList[rf.getLogIdx(args.PrevLogIndex+i)] = args.Entries[i-1]
 			} else {
 				rf.logList = append(rf.logList, args.Entries[i-1])
 			}
@@ -664,7 +774,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex + n
-		DPrintf("PrevLogIndex: %d, len(rf.logList): %d\n", args.PrevLogIndex, len(rf.logList))
+		DPrintf("PrevLogIndex: %d, rf Log real length: %d\n", args.PrevLogIndex, rf.getRealLogLength())
 	} else {
 		DPrintf("APPENDENTRY: machine %d receives a heart beat msg from leader machine %v at term %d !\n", rf.me, args.LeaderID, rf.currentTerm)
 		//heart beat
@@ -677,7 +787,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex
-		DPrintf("PrevLogIndex: %d, len(rf.logList): %d\n", args.PrevLogIndex, len(rf.logList))
+		DPrintf("PrevLogIndex: %d, rf Log real Length: %d\n", args.PrevLogIndex, rf.getRealLogLength())
 	}
 	rf.persist()
 	//DPrintf("machine %d should not reach this step in AppendEntry in 2A at term %d !\n", rf.me, rf.currentTerm)
@@ -689,15 +799,15 @@ func (rf *Raft) applyLogs() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//sanity check
-	if rf.commitIndex > len(rf.logList)-1 {
-		rf.commitIndex = len(rf.logList) - 1
+	if rf.commitIndex > rf.getRealLogLength() - 1 {
+		rf.commitIndex = rf.getRealLogLength() - 1 
 	}
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
+		DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.getLog(i).Command, rf.getLog(i).Term, rf.currentTerm)
 	}
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		//DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
-		rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.logList[i].Command, CommandValid: true}
+		rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
 	}
 	//just make sure we are not going back, maybe not needed?
 	if rf.lastApplied < rf.commitIndex {
