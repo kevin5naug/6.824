@@ -18,7 +18,7 @@ const Debug = 1
 //
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
-		log.Printf(format, a...)
+		log.Printf("[KVServer] "+format, a...)
 	}
 	return
 }
@@ -47,7 +47,6 @@ type KVServer struct {
 	Database          map[string]string
 	LastServiceRecord map[int64]int //clientID to opID
 	PendingOps        map[int]chan Op
-	CachedGet         map[int64]string //clientID to value of last get
 	LastAppliedLogIdx int
 	// reason why we need to cache and when we use it:
 	// client 1 sends a get request, server accepts it and has added it to the log
@@ -101,16 +100,11 @@ func (kv *KVServer) MonitorAndApplyPendingOps() {
 					DPrintf("Server %v executing latest append request for client %v: (key: %v, value: %v, OpID: %v)\n", kv.me, op.ClientID, op.Key, op.Value, op.OpID)
 				}
 				kv.LastServiceRecord[op.ClientID] = op.OpID
-				//need to cache the result for Get request
-				if op.Mode == "Get" {
-					kv.CachedGet[op.ClientID] = kv.Database[op.Key]
-					DPrintf("Server %v caching latest get request for client %v: (key: %v, value: %v, OpID: %v)\n", kv.me, op.ClientID, op.Key, op.Value, op.OpID)
-				}
 			}
 			if op.Mode == "Get" {
 				//it is possible that multiple new get requests from the same client with the same OpID get to this point at the same time
 				//the first one will get the value, but the rest of them should have value too
-				op.Value = kv.CachedGet[op.ClientID]
+				op.Value = kv.Database[op.Key]
 			}
 			ch, ok := kv.PendingOps[logEntry.CommandIndex]
 			if ok {
@@ -156,7 +150,6 @@ func (kv *KVServer) encodeData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.Database)
 	e.Encode(kv.LastServiceRecord)
-	e.Encode(kv.CachedGet)
 	e.Encode(kv.LastAppliedLogIdx)
 	return w.Bytes()
 }
@@ -171,14 +164,12 @@ func (kv *KVServer) setSnapshotData(data []byte) {
 
 	var database map[string]string
 	var lastServiceRecord map[int64]int //clientID to opID
-	var CachedGet map[int64]string      //clientID to value of last get
 	var LastAppliedLogIdx int
-	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil || d.Decode(&CachedGet) != nil || d.Decode(&LastAppliedLogIdx) != nil {
+	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil || d.Decode(&LastAppliedLogIdx) != nil {
 		DPrintf("ERROR: Server %d fails to read from persist data\n", kv.me)
 	} else {
 		kv.Database = database
 		kv.LastServiceRecord = lastServiceRecord
-		kv.CachedGet = CachedGet
 		kv.LastAppliedLogIdx = LastAppliedLogIdx
 	}
 }
@@ -206,8 +197,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		//we must have already served this request before
 		DPrintf("Server detect duplicate get request detected: (key: %v, OpID: %v, ClientID: %v) while serving OpID %v... \n", args.Key, args.OpID, args.ClientID, lastOpID)
 		reply.Err = ErrDuplicate
-		reply.Value = kv.CachedGet[args.ClientID]
-		//delete(kv.CachedGet, args.ClientID) //might want to delete it to save the states of our kv server
+		reply.Value = kv.Database[args.Key]
 		kv.mu.Unlock()
 		return
 	}
@@ -395,7 +385,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.Database = make(map[string]string)
 	kv.LastServiceRecord = make(map[int64]int) //clientID to opID
 	kv.PendingOps = make(map[int]chan Op)
-	kv.CachedGet = make(map[int64]string)
 	kv.LastAppliedLogIdx = -1
 	serverData := persister.ReadSnapshot()
 	kv.setSnapshotData(serverData)

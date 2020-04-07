@@ -1071,9 +1071,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	//ignore old request
 	if args.LastIncludedIndex < rf.lastIncludedIndex {
 		DPrintf("INSTALLSNAPSHOT: old request from machine %d detected. Follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
+		DPrintf("args.LastIncludedIndex: %d, rf.lastIncludedIndex: %d \n", args.LastIncludedIndex, rf.lastIncludedIndex)
 		return
 	}
-
+	if args.LastIncludedIndex <= rf.commitIndex {
+		DPrintf("INSTALLSNAPSHOT snapshot info not useful:  request from machine %d detected. Follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
+		DPrintf("args.LastIncludedIndex: %d, rf.lastIncludedIndex: %d \n", args.LastIncludedIndex, rf.lastIncludedIndex)
+	}
 	//backup: args.LastIncludedIndex + 1 < rf.getRealLogLength() && ((args.LastIncludedIndex == rf.lastIncludedIndex && args.LastIncludedTerm == rf.lastIncludedTerm) || rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm)
 
 	if len(rf.logList) > 0 && rf.getLogIdx(args.LastIncludedIndex) >= 0 && rf.getLogIdx(args.LastIncludedIndex) < len(rf.logList) && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
@@ -1304,14 +1308,17 @@ func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 	defer rf.mu.Unlock()
 	if logIdx <= rf.lastIncludedIndex || rf.lastIncludedIndex >= rf.getLastRealIdx() {
 		//old snapshot request, ignore
-		DPrintf("Old snapshot request for machine %d detected. Ignoring...\n", rf.me)
-		DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, rf.commitIndex %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, rf.commitIndex, len(rf.logList))
+		DPrintf("Old snapshot request for machine %d detected. logIdx: %d, rf.lastIncludedIndex: %d, rf.commitIndex %d, current log length: %d. Ignoring...\n", rf.me, logIdx, rf.lastIncludedIndex, rf.commitIndex, len(rf.logList))
+		//DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, rf.commitIndex %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, rf.commitIndex, len(rf.logList))
 		return
 	}
-	DPrintf("machine %d processing snapshot request at term %d \n", rf.me, rf.currentTerm)
-	DPrintf("raft real log length: %d, lastIncludedIndex %d\n", rf.getRealLogLength(), rf.lastIncludedIndex)
+	DPrintf("machine %d processing snapshot request at term %d. raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.me, rf.currentTerm, rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
+	//DPrintf("raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
 
 	relativelogIdx := rf.getLogIdx(logIdx)
+	if relativelogIdx < 0 || relativelogIdx >= len(rf.logList) {
+		DPrintf("FATAL failure incoming: relativelogIdx %d, len(rf.logList): %d \n", relativelogIdx, len(rf.logList))
+	}
 	rf.lastIncludedTerm = rf.getLog(logIdx).Term
 	rf.lastIncludedIndex = logIdx
 
