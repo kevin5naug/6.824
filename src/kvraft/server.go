@@ -47,7 +47,6 @@ type KVServer struct {
 	Database          map[string]string
 	LastServiceRecord map[int64]int //clientID to opID
 	PendingOps        map[int]chan Op
-	LastAppliedLogIdx int
 	// reason why we need to cache and when we use it:
 	// client 1 sends a get request, server accepts it and has added it to the log
 	// but the request gets timed out before server send the get results to PendingOps,
@@ -81,13 +80,21 @@ func (kv *KVServer) MonitorAndApplyPendingOps() {
 				serverData := logEntry.Command.([]byte)
 				kv.mu.Lock()
 				kv.setSnapshotData(serverData)
+				DPrintf("RESET STATE: server %d has reset its state\n", kv.me)
+				kv.mu.Unlock()
+				continue
+			}
+			if logEntry.Command == nil {
+				//no-op
+				kv.mu.Lock()
+				DPrintf("Server %v last applied log index: %d\n", kv.me, logEntry.CommandIndex-1)
+				kv.checkNeedsForSnapshot(logEntry.CommandIndex - 1)
 				kv.mu.Unlock()
 				continue
 			}
 			op := logEntry.Command.(Op)
 			kv.mu.Lock()
-			kv.LastAppliedLogIdx = logEntry.CommandIndex - 1
-			DPrintf("Server %v last applied log index updated: %d\n", kv.me, kv.LastAppliedLogIdx)
+			DPrintf("Server %v last applied log index: %d\n", kv.me, logEntry.CommandIndex-1)
 			lastOpID, ok := kv.LastServiceRecord[op.ClientID]
 			if !ok || op.OpID > lastOpID {
 				switch op.Mode {
@@ -141,7 +148,7 @@ func (kv *KVServer) checkNeedsForSnapshot(logIdx int) {
 	}
 	serverStates := kv.encodeData()
 	DPrintf("Server %d finds snapshot is needed. Going to discard logs with log index up to(including): %d\n", kv.me, logIdx)
-	go kv.rf.TakeSnapshot(logIdx, serverStates)
+	kv.rf.TakeSnapshot(logIdx, serverStates)
 }
 
 //
@@ -150,7 +157,6 @@ func (kv *KVServer) encodeData() []byte {
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.Database)
 	e.Encode(kv.LastServiceRecord)
-	e.Encode(kv.LastAppliedLogIdx)
 	return w.Bytes()
 }
 
@@ -164,13 +170,11 @@ func (kv *KVServer) setSnapshotData(data []byte) {
 
 	var database map[string]string
 	var lastServiceRecord map[int64]int //clientID to opID
-	var LastAppliedLogIdx int
-	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil || d.Decode(&LastAppliedLogIdx) != nil {
+	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil {
 		DPrintf("ERROR: Server %d fails to read from persist data\n", kv.me)
 	} else {
 		kv.Database = database
 		kv.LastServiceRecord = lastServiceRecord
-		kv.LastAppliedLogIdx = LastAppliedLogIdx
 	}
 }
 
@@ -330,29 +334,6 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-func (kv *KVServer) periodicSnapshot() {
-	magicNumber := 200
-	for {
-		time.Sleep(time.Duration(magicNumber) * time.Millisecond)
-		kv.mu.Lock()
-		if kv.maxraftstate == -1 || kv.dead != 0 {
-			//snapshot disabled
-			kv.mu.Unlock()
-			return
-		}
-		curRaftStateSize := kv.rf.GetRaftStateSize()
-		if curRaftStateSize < kv.maxraftstate*8/10 {
-			DPrintf("PERIODIC SNAPSHOT: Server %d finds snapshot is not needed for logIdx: %d, current raft state size is %d, but the threshold is %d \n", kv.me, kv.LastAppliedLogIdx, curRaftStateSize, kv.maxraftstate*8/10)
-			kv.mu.Unlock()
-			continue
-		}
-		serverStates := kv.encodeData()
-		DPrintf("PERIODIC SNAPSHOT: Server %d finds snapshot is needed. Going to discard logs with log index up to(including): %d\n", kv.me, kv.LastAppliedLogIdx)
-		go kv.rf.TakeSnapshot(kv.LastAppliedLogIdx, serverStates)
-		kv.mu.Unlock()
-	}
-}
-
 //
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
@@ -385,11 +366,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.Database = make(map[string]string)
 	kv.LastServiceRecord = make(map[int64]int) //clientID to opID
 	kv.PendingOps = make(map[int]chan Op)
-	kv.LastAppliedLogIdx = -1
 	serverData := persister.ReadSnapshot()
 	kv.setSnapshotData(serverData)
+	DPrintf("RESTART: server %d is reading from its persisted file \n", kv.me)
 	go kv.MonitorAndApplyPendingOps()
-	go kv.periodicSnapshot()
 
 	return kv
 }

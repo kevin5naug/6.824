@@ -183,6 +183,7 @@ func (rf *Raft) encodeRaftState() []byte {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	DPrintf("RESTART: Machine %d is reading from its persisted file\n", rf.me)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -287,6 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("ELECTION VOTE NEWS: candidate machine %v requested vote from machine %v for term %d with lastLogIndex %d and lastLogTerm %d\n", args.CandidateID, rf.me, args.Term, args.LastLogIndex, args.LastLogTerm)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -300,13 +302,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// }
 		lastRealIdx := rf.getLastRealIdx()
 		if lastRealIdx == rf.lastIncludedIndex {
+			DPrintf("ELECTION constraint checking: machine %v lastRealIdx==rf.lastIncludedIndex %d, lastIncludedterm %d\n", rf.me, lastRealIdx, rf.lastIncludedIndex)
 			if args.LastLogTerm < rf.lastIncludedTerm || (args.LastLogTerm == rf.lastIncludedTerm && args.LastLogIndex < rf.lastIncludedIndex) {
 				isValidCandidate = false
+				DPrintf("ELECTION constraint checking failed: invalid candidate\n")
 			}
 		} else {
 			lastRfLog := rf.getLog(lastRealIdx)
+			DPrintf("ELECTION constraint checking: machine %v lastRealIdx %d, llastRfLog.Term %d\n", rf.me, lastRealIdx, lastRfLog.Term)
 			if args.LastLogTerm < lastRfLog.Term || (args.LastLogTerm == lastRfLog.Term && args.LastLogIndex < lastRealIdx) {
 				isValidCandidate = false
+				DPrintf("ELECTION constraint checking failed: invalid candidate\n")
 			}
 		}
 	}
@@ -1008,7 +1014,7 @@ func (rf *Raft) advertiseLeaderStatus() {
 				}(i, aeargs)
 			} else {
 				//send snapshot instead
-				DPrintf("Leader machine %d at term %d decides to send install snapshot request to follower machine %d instead\n", rf.me, rf.currentTerm, i)
+				DPrintf("Leader machine %d at term %d decides to send install snapshot request to follower machine %d instead. rf.nextIndex[i]: %d, rf.lastIncludedIndex: %d \n", rf.me, rf.currentTerm, i, rf.nextIndex[i], rf.lastIncludedIndex)
 				var isargs InstallSnapshotArgs
 				isargs.Term = rf.currentTerm
 				isargs.LeaderID = rf.me
@@ -1076,7 +1082,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	if args.LastIncludedIndex <= rf.commitIndex {
 		DPrintf("INSTALLSNAPSHOT snapshot info not useful:  request from machine %d detected. Follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
-		DPrintf("args.LastIncludedIndex: %d, rf.lastIncludedIndex: %d \n", args.LastIncludedIndex, rf.lastIncludedIndex)
+		DPrintf("args.LastIncludedIndex: %d, rf.commitIndex: %d \n", args.LastIncludedIndex, rf.commitIndex)
 	}
 	//backup: args.LastIncludedIndex + 1 < rf.getRealLogLength() && ((args.LastIncludedIndex == rf.lastIncludedIndex && args.LastIncludedTerm == rf.lastIncludedTerm) || rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm)
 
@@ -1184,8 +1190,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		reply.Success = false
 		reply.MatchIndex = matchIndex
+		DPrintf("Follower machine %d replied matchIndex %d to leader machine %d\n", rf.me, matchIndex, args.LeaderID)
 	} else if args.Entries != nil {
-		DPrintf("APPENDENTRY: machine %d adding new logs from leader machine %v at term %d !\n", rf.me, args.LeaderID, rf.currentTerm)
 		//we can find the prevLog
 		//should not truncate the log !!!
 		n := len(args.Entries)
@@ -1223,7 +1229,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex + n
-		DPrintf("PrevLogIndex: %d, rf Log real length: %d\n", args.PrevLogIndex, rf.getRealLogLength())
+		DPrintf("APPENDENTRY: machine %d adding new logs from leader machine %v at term %d ! After adding PrevLogIndex: %d, replied matchIndex: %d, rf Log real length: %d\n", rf.me, args.LeaderID, rf.currentTerm, args.PrevLogIndex, args.PrevLogIndex+n, rf.getRealLogLength())
 	} else {
 		DPrintf("APPENDENTRY: machine %d receives a heart beat msg from leader machine %v at term %d !\n", rf.me, args.LeaderID, rf.currentTerm)
 		//heart beat
@@ -1284,9 +1290,7 @@ func (rf *Raft) applyLogsThread() {
 		}
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			//DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
-			if rf.getLog(i).Command != nil {
-				rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
-			}
+			rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
 		}
 		//just make sure we are not going back, maybe not needed?
 		if rf.lastApplied < rf.commitIndex {
@@ -1315,14 +1319,19 @@ func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 	DPrintf("machine %d processing snapshot request at term %d. raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.me, rf.currentTerm, rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
 	//DPrintf("raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
 
+	prevRealLogLength := rf.getRealLogLength()
 	relativelogIdx := rf.getLogIdx(logIdx)
 	if relativelogIdx < 0 || relativelogIdx >= len(rf.logList) {
-		DPrintf("FATAL failure incoming: relativelogIdx %d, len(rf.logList): %d \n", relativelogIdx, len(rf.logList))
+		DPrintf("FATAL failure incoming for machine %d processing snapshot: relativelogIdx %d, len(rf.logList): %d \n", rf.me, relativelogIdx, len(rf.logList))
 	}
 	rf.lastIncludedTerm = rf.getLog(logIdx).Term
 	rf.lastIncludedIndex = logIdx
 
 	rf.logList = rf.logList[relativelogIdx+1:]
+	curRealLogLength := rf.getRealLogLength()
+	if prevRealLogLength != curRealLogLength {
+		DPrintf("FATAL after snapshot, machine %d prevRealLogLength %d != curRealLogLength %d\n", rf.me, prevRealLogLength, curRealLogLength)
+	}
 	rf.persist()
 	rfStates := rf.encodeRaftState()
 	rf.persister.SaveStateAndSnapshot(rfStates, serverStates)
