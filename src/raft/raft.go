@@ -86,6 +86,7 @@ type Raft struct {
 	rng                       *rand.Rand
 	voteCount                 int
 	applyCh                   chan ApplyMsg
+	applyCond                 *sync.Cond
 
 	//lab3B
 	lastIncludedIndex int //persistent in snapshot
@@ -415,30 +416,149 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	//index = len(rf.logList) //should we put -1 here???
 	index = rf.getRealLogLength()
 	term = rf.currentTerm
-	return index, term, isLeader
+	n := len(rf.peers)
+	for i := 0; i < n; i++ {
+		if i == rf.me {
+			continue
+		}
+		snapshotNeeded := false
+		if rf.nextIndex[i] < rf.getRealLogLength() {
+			if rf.nextIndex[i] <= rf.lastIncludedIndex {
+				//send snapshot instead for this round of advertisement
+				snapshotNeeded = true
+			} else {
+				snapshotNeeded = false
+			}
+		} else {
+			snapshotNeeded = false
+		}
+		if snapshotNeeded == false {
+			var aeargs AppendEntryArgs
+			aeargs.Term = rf.currentTerm
+			aeargs.LeaderID = rf.me
+			aeargs.PrevLogIndex = rf.nextIndex[i] - 1
+			if rf.nextIndex[i] < rf.getRealLogLength() {
+				// rf.nextIndex[i] > rf.lastIncludedIndex guaranteed
+				aeargs.Entries = rf.logList[rf.getLogIdx(rf.nextIndex[i]):]
+			} else {
+				aeargs.Entries = nil
+			}
+			//keep filling in AppendEntryArgs
+			if aeargs.PrevLogIndex >= 0 {
+				if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
+					aeargs.PrevLogTerm = rf.lastIncludedTerm
+				} else {
+					aeargs.PrevLogTerm = rf.getLog(aeargs.PrevLogIndex).Term
+				}
+			}
+			aeargs.LeaderCommit = rf.commitIndex
+			//send append entries
+			go func(peerID int, aeargs AppendEntryArgs) {
+				var aereply AppendEntryReply
+				ok := rf.sendAppendEntry(peerID, &aeargs, &aereply)
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.state != "leader" {
+						return
+					}
+					if aereply.Term > rf.currentTerm {
+						rf.currentTerm = aereply.Term
+						rf.state = "follower"
+						rf.votedFor = -1
+						rf.persist()
+						return
+					} else if aereply.Term == rf.currentTerm {
+						if aereply.Success {
+							rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							rf.matchIndex[peerID] = aereply.MatchIndex
+							if rf.commitIndex < rf.matchIndex[peerID] && rf.getLog(rf.matchIndex[peerID]).Term == rf.currentTerm {
+								//only current term can commit by counting
+								//since it is guaranteed that matchIndex > commitIndex >= lastIncludedIndex(kv server state),
+								//we don't need to worry about rf.matchIndex[peerID] overflow
+								successCount := 1
+								n := len(rf.peers)
+								for i := 0; i < n; i++ {
+									if i == rf.me {
+										continue
+									}
+									if rf.matchIndex[i] >= rf.matchIndex[peerID] {
+										successCount++
+									}
+								}
+								if successCount > n/2 {
+									rf.commitIndex = rf.matchIndex[peerID]
+									rf.applyCond.Signal()
+								}
+							}
+						} else {
+							//appendEntry fails
+							if aereply.MatchIndex == -1 {
+								//no log in PrevLogTerm
+								if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
+									//need to send snapshot next time
+									rf.nextIndex[peerID] = rf.lastIncludedIndex - 1 //this will guarantee to trigger leader sending snapshot?
+								} else {
+									//aeargs.PrevLogIndex > rf.lastIncludedIndex >= -1
+									curPreIndex := aeargs.PrevLogIndex - 1
+									for curPreIndex > rf.lastIncludedIndex && rf.getLog(curPreIndex).Term >= aeargs.PrevLogTerm {
+										curPreIndex--
+									}
+									if curPreIndex <= rf.lastIncludedIndex {
+										rf.nextIndex[peerID] = rf.lastIncludedIndex + 1 //last chance
+									} else {
+										rf.nextIndex[peerID] = curPreIndex + 1
+									}
+								}
+							} else {
+								rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							}
+							//rf.nextIndex[peerID] = aereply.MatchIndex + 1
+						}
+					} else {
+						//do nothing
+					}
+				}
+			}(i, aeargs)
+		} else {
+			//send snapshot instead
+			DPrintf("Leader machine %d at term %d decides to send install snapshot request to follower machine %d instead\n", rf.me, rf.currentTerm, i)
+			var isargs InstallSnapshotArgs
+			isargs.Term = rf.currentTerm
+			isargs.LeaderID = rf.me
+			isargs.LastIncludedIndex = rf.lastIncludedIndex
+			isargs.LastIncludedTerm = rf.lastIncludedTerm
+			isargs.Data = rf.persister.ReadSnapshot()
+			go func(peerID int, isargs InstallSnapshotArgs) {
+				var isreply InstallSnapshotReply
+				ok := rf.sendInstallSnapshot(peerID, &isargs, &isreply)
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.state != "leader" {
+						return
+					}
+					if isreply.Term > rf.currentTerm {
+						rf.currentTerm = isargs.Term
+						rf.state = "follower"
+						rf.votedFor = -1
+						rf.persist()
+						return
+					}
+					if isreply.Term == rf.currentTerm {
+						if rf.matchIndex[peerID] < isargs.LastIncludedIndex {
+							rf.matchIndex[peerID] = isargs.LastIncludedIndex
+						}
+						rf.nextIndex[peerID] = rf.matchIndex[peerID] + 1
+					} else {
+						//do nothing
+					}
 
-	// use the heartbeat message to send out the logs
-	// n := len(rf.peers)
-	// appendSuccessCount := 1
-	// for i:=0;i<n;i++{
-	// 	if i==rf.me {
-	// 		continue
-	// 	}
-	// 	var args AppendEntryArgs
-	// 	args.Term = rf.currentTerm
-	// 	args.LeaderID = rf.me
-	// 	args.PrevLogIndex = rf.nextIndex[i]-1
-	// 	if args.PrevLogIndex >= 0 {
-	// 		args.PrevLogTerm = rf.logList[args.PrevLogIndex].Term
-	// 	}
-	// 	if rf.nextIndex[i] < len(rf.logList) {
-	// 		args.Entries = rf.logList[rf.nextIndex[i]:]
-	// 	}
-	// 	args.LeaderCommit = rf.commitIndex
-	// 	go func(peerID int, args AppendEntryArgs){
-	// 		var reply AppendEntryReply
-	// 	}(i, args)
-	// }
+				}
+			}(i, isargs)
+		}
+	}
+	return index, term, isLeader
 }
 
 //
@@ -460,14 +580,153 @@ func (rf *Raft) StartIfSpaceAllow(command interface{}, maxRaftState int) (int, i
 		return index, term, isLeader, isBusy
 	}
 	//leader appends the log and send out appendEntry request to followers
-	DPrintf("*************************************\n")
-	DPrintf("Leader machine %d has received one log{command: %v, writtenTerm: %v} from the client\n", rf.me, command, rf.currentTerm)
-	DPrintf("*************************************\n")
 	rf.logList = append(rf.logList, LogEntry{command, rf.currentTerm})
 	rf.persist()
 	//index = len(rf.logList) //should we put -1 here???
 	index = rf.getRealLogLength()
 	term = rf.currentTerm
+	n := len(rf.peers)
+	for i := 0; i < n; i++ {
+		if i == rf.me {
+			continue
+		}
+		snapshotNeeded := false
+		if rf.nextIndex[i] < rf.getRealLogLength() {
+			if rf.nextIndex[i] <= rf.lastIncludedIndex {
+				//send snapshot instead for this round of advertisement
+				snapshotNeeded = true
+			} else {
+				snapshotNeeded = false
+			}
+		} else {
+			snapshotNeeded = false
+		}
+		if snapshotNeeded == false {
+			var aeargs AppendEntryArgs
+			aeargs.Term = rf.currentTerm
+			aeargs.LeaderID = rf.me
+			aeargs.PrevLogIndex = rf.nextIndex[i] - 1
+			if rf.nextIndex[i] < rf.getRealLogLength() {
+				// rf.nextIndex[i] > rf.lastIncludedIndex guaranteed
+				aeargs.Entries = rf.logList[rf.getLogIdx(rf.nextIndex[i]):]
+			} else {
+				aeargs.Entries = nil
+			}
+			//keep filling in AppendEntryArgs
+			if aeargs.PrevLogIndex >= 0 {
+				if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
+					aeargs.PrevLogTerm = rf.lastIncludedTerm
+				} else {
+					aeargs.PrevLogTerm = rf.getLog(aeargs.PrevLogIndex).Term
+				}
+			}
+			aeargs.LeaderCommit = rf.commitIndex
+			//send append entries
+			go func(peerID int, aeargs AppendEntryArgs) {
+				var aereply AppendEntryReply
+				ok := rf.sendAppendEntry(peerID, &aeargs, &aereply)
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.state != "leader" {
+						return
+					}
+					if aereply.Term > rf.currentTerm {
+						rf.currentTerm = aereply.Term
+						rf.state = "follower"
+						rf.votedFor = -1
+						rf.persist()
+						return
+					} else if aereply.Term == rf.currentTerm {
+						if aereply.Success {
+							rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							rf.matchIndex[peerID] = aereply.MatchIndex
+							if rf.commitIndex < rf.matchIndex[peerID] && rf.getLog(rf.matchIndex[peerID]).Term == rf.currentTerm {
+								//only current term can commit by counting
+								//since it is guaranteed that matchIndex > commitIndex >= lastIncludedIndex(kv server state),
+								//we don't need to worry about rf.matchIndex[peerID] overflow
+								successCount := 1
+								n := len(rf.peers)
+								for i := 0; i < n; i++ {
+									if i == rf.me {
+										continue
+									}
+									if rf.matchIndex[i] >= rf.matchIndex[peerID] {
+										successCount++
+									}
+								}
+								if successCount > n/2 {
+									rf.commitIndex = rf.matchIndex[peerID]
+									rf.applyCond.Signal()
+								}
+							}
+						} else {
+							//appendEntry fails
+							if aereply.MatchIndex == -1 {
+								//no log in PrevLogTerm
+								if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
+									//need to send snapshot next time
+									rf.nextIndex[peerID] = rf.lastIncludedIndex - 1 //this will guarantee to trigger leader sending snapshot?
+								} else {
+									//aeargs.PrevLogIndex > rf.lastIncludedIndex >= -1
+									curPreIndex := aeargs.PrevLogIndex - 1
+									for curPreIndex > rf.lastIncludedIndex && rf.getLog(curPreIndex).Term >= aeargs.PrevLogTerm {
+										curPreIndex--
+									}
+									if curPreIndex <= rf.lastIncludedIndex {
+										rf.nextIndex[peerID] = rf.lastIncludedIndex + 1 //last chance
+									} else {
+										rf.nextIndex[peerID] = curPreIndex + 1
+									}
+								}
+							} else {
+								rf.nextIndex[peerID] = aereply.MatchIndex + 1
+							}
+							//rf.nextIndex[peerID] = aereply.MatchIndex + 1
+						}
+					} else {
+						//do nothing
+					}
+				}
+			}(i, aeargs)
+		} else {
+			//send snapshot instead
+			DPrintf("Leader machine %d at term %d decides to send install snapshot request to follower machine %d instead\n", rf.me, rf.currentTerm, i)
+			var isargs InstallSnapshotArgs
+			isargs.Term = rf.currentTerm
+			isargs.LeaderID = rf.me
+			isargs.LastIncludedIndex = rf.lastIncludedIndex
+			isargs.LastIncludedTerm = rf.lastIncludedTerm
+			isargs.Data = rf.persister.ReadSnapshot()
+			go func(peerID int, isargs InstallSnapshotArgs) {
+				var isreply InstallSnapshotReply
+				ok := rf.sendInstallSnapshot(peerID, &isargs, &isreply)
+				if ok {
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
+					if rf.state != "leader" {
+						return
+					}
+					if isreply.Term > rf.currentTerm {
+						rf.currentTerm = isargs.Term
+						rf.state = "follower"
+						rf.votedFor = -1
+						rf.persist()
+						return
+					}
+					if isreply.Term == rf.currentTerm {
+						if rf.matchIndex[peerID] < isargs.LastIncludedIndex {
+							rf.matchIndex[peerID] = isargs.LastIncludedIndex
+						}
+						rf.nextIndex[peerID] = rf.matchIndex[peerID] + 1
+					} else {
+						//do nothing
+					}
+
+				}
+			}(i, isargs)
+		}
+	}
 	return index, term, isLeader, isBusy
 }
 
@@ -529,6 +788,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.voteCount = 0
 	rf.found_leader_or_candidate = false
 	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&sync.Mutex{})
 	//initialize for lab3B
 	rf.lastIncludedIndex = -1
 	rf.lastIncludedTerm = 0
@@ -537,6 +797,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	rf.persist()
 	go rf.handleTimeOut()
+	go rf.applyLogsThread()
 
 	return rf
 }
@@ -613,6 +874,7 @@ func (rf *Raft) startElectionCampaign() {
 								rf.nextIndex[peerID] = rf.getRealLogLength()
 								rf.matchIndex[peerID] = -1
 							}
+							rf.logList = append(rf.logList, LogEntry{nil, rf.currentTerm})
 							go rf.advertiseLeaderStatus()
 						}
 					}
@@ -625,7 +887,7 @@ func (rf *Raft) startElectionCampaign() {
 }
 
 func (rf *Raft) advertiseLeaderStatus() {
-	magicNumber := 100
+	magicNumber := 150
 	for {
 		rf.mu.Lock()
 		if rf.state != "leader" || rf.dead != 0 {
@@ -686,8 +948,13 @@ func (rf *Raft) advertiseLeaderStatus() {
 							return
 						} else if aereply.Term == rf.currentTerm {
 							if aereply.Success {
+								DPrintf("APPENDENTRY request SUCCEED: to machine %d made by leader machine %v at term %d !\n", peerID, aeargs.LeaderID, rf.currentTerm)
+								DPrintf("rf.nextIndex[peerID]: %d, returned matchIndex: %d,  sent log lengths: %d, current log length: %d, current commitIndex: %d, lastIncludedIndex: %d\n", rf.nextIndex[peerID], aereply.MatchIndex, len(aeargs.Entries), len(rf.logList), rf.commitIndex, rf.lastIncludedIndex)
 								rf.nextIndex[peerID] = aereply.MatchIndex + 1
 								rf.matchIndex[peerID] = aereply.MatchIndex
+								if rf.commitIndex < rf.matchIndex[peerID] {
+									DPrintf("rf.getLog(rf.matchIndex[peerID]).Term: %d, rf.currentTerm: %d\n", rf.getLog(rf.matchIndex[peerID]).Term, rf.currentTerm)
+								}
 								if rf.commitIndex < rf.matchIndex[peerID] && rf.getLog(rf.matchIndex[peerID]).Term == rf.currentTerm {
 									//only current term can commit by counting
 									//since it is guaranteed that matchIndex > commitIndex >= lastIncludedIndex(kv server state),
@@ -703,8 +970,11 @@ func (rf *Raft) advertiseLeaderStatus() {
 										}
 									}
 									if successCount > n/2 {
+										DPrintf("APPENDENTRY caused new logs to be committed: to machine %d made by leader machine %v at term %d !\n", peerID, aeargs.LeaderID, rf.currentTerm)
 										rf.commitIndex = rf.matchIndex[peerID]
-										go rf.applyLogs()
+										rf.applyCond.Signal()
+									} else {
+										DPrintf("APPENDENTRY no log committed: to machine %d made by leader machine %v at term %d !\n", peerID, aeargs.LeaderID, rf.currentTerm)
 									}
 								}
 							} else {
@@ -865,7 +1135,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 				DPrintf("found args.PrevLogIndex == rf.lastIncludedIndex \n")
 				DPrintf("arg.PrevLogTerm: %d, rf.lastIncludedTerm: %d \n", args.PrevLogTerm, rf.lastIncludedTerm)
 			} else {
-				DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[args.PrevLogIndex].Term, args.Term)
+				pos := rf.getLogIdx(args.PrevLogIndex)
+				if pos >= 0 && pos < len(rf.logList) {
+					DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[pos].Term, args.Term)
+				}
 			}
 		}
 		//we can't find prevLog
@@ -942,7 +1215,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			if args.LeaderCommit >= args.PrevLogIndex+n {
 				rf.commitIndex = args.PrevLogIndex + n
 			}
-			go rf.applyLogs()
+			rf.applyCond.Signal()
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex + n
@@ -955,7 +1228,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			if args.LeaderCommit >= args.PrevLogIndex {
 				rf.commitIndex = args.PrevLogIndex
 			}
-			go rf.applyLogs()
+			rf.applyCond.Signal()
 		}
 		reply.Success = true
 		reply.MatchIndex = args.PrevLogIndex
@@ -987,6 +1260,38 @@ func (rf *Raft) applyLogs() {
 	}
 }
 
+func (rf *Raft) applyLogsThread() {
+	for {
+		rf.applyCond.L.Lock()
+		rf.applyCond.Wait()
+		rf.applyCond.L.Unlock()
+		rf.mu.Lock()
+		if rf.dead == 1 {
+			//this machine is dead, no need to loop anymore
+			rf.mu.Unlock()
+			return
+		}
+		//sanity check
+		if rf.commitIndex > rf.getRealLogLength()-1 {
+			rf.commitIndex = rf.getRealLogLength() - 1
+		}
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.getLog(i).Command, rf.getLog(i).Term, rf.currentTerm)
+		}
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			//DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
+			if rf.getLog(i).Command != nil {
+				rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
+			}
+		}
+		//just make sure we are not going back, maybe not needed?
+		if rf.lastApplied < rf.commitIndex {
+			rf.lastApplied = rf.commitIndex
+		}
+		rf.mu.Unlock()
+	}
+}
+
 //
 func (rf *Raft) GetRaftStateSize() int {
 	ans := rf.persister.RaftStateSize()
@@ -997,18 +1302,19 @@ func (rf *Raft) GetRaftStateSize() int {
 func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if logIdx <= rf.lastIncludedIndex {
+	if logIdx <= rf.lastIncludedIndex || rf.lastIncludedIndex >= rf.getLastRealIdx() {
 		//old snapshot request, ignore
-		DPrintf("Old snapshot request detected. Ignoring...\n")
-		DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, len(rf.logList))
+		DPrintf("Old snapshot request for machine %d detected. Ignoring...\n", rf.me)
+		DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, rf.commitIndex %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, rf.commitIndex, len(rf.logList))
 		return
 	}
 	DPrintf("machine %d processing snapshot request at term %d \n", rf.me, rf.currentTerm)
 	DPrintf("raft real log length: %d, lastIncludedIndex %d\n", rf.getRealLogLength(), rf.lastIncludedIndex)
+
 	relativelogIdx := rf.getLogIdx(logIdx)
 	rf.lastIncludedTerm = rf.getLog(logIdx).Term
 	rf.lastIncludedIndex = logIdx
-	
+
 	rf.logList = rf.logList[relativelogIdx+1:]
 	rf.persist()
 	rfStates := rf.encodeRaftState()

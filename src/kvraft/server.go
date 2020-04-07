@@ -13,7 +13,7 @@ import (
 )
 
 //
-const Debug = 0
+const Debug = 1
 
 //
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -218,20 +218,21 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	command.Value = ""
 	command.OpID = args.OpID
 	command.ClientID = args.ClientID
-	idx, _, isLeader := kv.rf.Start(command)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	// idx, _, isLeader, isBusy := kv.rf.StartIfSpaceAllow(command, kv.maxraftstate)
+	// idx, _, isLeader := kv.rf.Start(command)
 	// if !isLeader {
 	// 	reply.Err = ErrWrongLeader
 	// 	return
 	// }
-	// if isBusy {
-	// 	reply.Err = ErrBusy
-	// 	return
-	// }
+	idx, _, isLeader, isBusy := kv.rf.StartIfSpaceAllow(command, kv.maxraftstate)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	if isBusy {
+		reply.Err = ErrBusy
+		time.Sleep(1 * time.Second)
+		return
+	}
 	ch := kv.AddPendingOps(idx)
 	defer kv.DeletePendingOps(idx)
 	select {
@@ -284,20 +285,21 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	command.Value = args.Value
 	command.OpID = args.OpID
 	command.ClientID = args.ClientID
-	idx, _, isLeader := kv.rf.Start(command)
-	if !isLeader {
-		reply.Err = ErrWrongLeader
-		return
-	}
-	// idx, _, isLeader, isBusy := kv.rf.StartIfSpaceAllow(command, kv.maxraftstate)
+	// idx, _, isLeader := kv.rf.Start(command)
 	// if !isLeader {
 	// 	reply.Err = ErrWrongLeader
 	// 	return
 	// }
-	// if isBusy {
-	// 	reply.Err = ErrBusy
-	// 	return
-	// }
+	idx, _, isLeader, isBusy := kv.rf.StartIfSpaceAllow(command, kv.maxraftstate)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	if isBusy {
+		reply.Err = ErrBusy
+		time.Sleep(1 * time.Second)
+		return
+	}
 	ch := kv.AddPendingOps(idx)
 	defer kv.DeletePendingOps(idx)
 	select {
@@ -343,7 +345,7 @@ func (kv *KVServer) periodicSnapshot() {
 	for {
 		time.Sleep(time.Duration(magicNumber) * time.Millisecond)
 		kv.mu.Lock()
-		if kv.maxraftstate == -1 {
+		if kv.maxraftstate == -1 || kv.dead != 0 {
 			//snapshot disabled
 			kv.mu.Unlock()
 			return
