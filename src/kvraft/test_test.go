@@ -1,17 +1,20 @@
 package kvraft
 
-import "../porcupine"
-import "../models"
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "log"
-import "strings"
-import "sync"
-import "sync/atomic"
-import "fmt"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"../models"
+	"../porcupine"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -243,7 +246,11 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		}
 
 		if crash {
-			// log.Printf("shutdown servers\n")
+			log.Printf("***************************\n")
+			log.Printf("\n")
+			log.Printf("shutdown servers\n")
+			log.Printf("\n")
+			log.Printf("***************************\n")
 			for i := 0; i < nservers; i++ {
 				cfg.ShutdownServer(i)
 			}
@@ -639,7 +646,11 @@ func TestSnapshotRPC3B(t *testing.T) {
 		time.Sleep(electionTimeout)
 		Put(cfg, ck1, "b", "B")
 	}
-
+	DPrintf("***************************************\n")
+	DPrintf("\n")
+	DPrintf("checkpoint 1 reached\n")
+	DPrintf("\n")
+	DPrintf("***************************************\n")
 	// check that the majority partition has thrown away
 	// most of its log entries.
 	sz := cfg.LogSize()
@@ -660,6 +671,11 @@ func TestSnapshotRPC3B(t *testing.T) {
 		check(cfg, t, ck1, "49", "49")
 	}
 
+	DPrintf("***************************************\n")
+	DPrintf("\n")
+	DPrintf("checkpoint 2 reached\n")
+	DPrintf("\n")
+	DPrintf("***************************************\n")
 	// now everybody
 	cfg.partition([]int{0, 1, 2}, []int{})
 

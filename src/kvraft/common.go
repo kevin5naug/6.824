@@ -7,7 +7,8 @@ const (
 	ErrDuplicate   = "ErrDuplicate"
 	ErrOpMismatch  = "ErrOpMismatch"
 	ErrTimeOut     = "ErrTimeOut"
-	ErrUnknown       = "ErrUnknown"
+	ErrUnknown     = "ErrUnknown"
+	ErrBusy        = "ErrBusy"
 )
 
 type Err string

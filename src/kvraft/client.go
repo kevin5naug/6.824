@@ -68,9 +68,9 @@ func (ck *Clerk) Get(key string) string {
 				ck.lastLeaderID = tryLeaderID%n
 				return greply.Value
 			case ErrDuplicate:
-				//DPrintf("************************** FATAL(should rarely see this message) **************************\n")
+				DPrintf("************************** FATAL(should rarely see this message) **************************\n")
 				DPrintf("Client %v Get Error from Server %v: %v for Key %v, OpID %v \n", ck.me, tryLeaderID%n, greply.Err, key, opID)
-				//DPrintf("************************** FATAL(should rarely see this message) **************************\n")
+				DPrintf("************************** FATAL(should rarely see this message) **************************\n")
 				ck.lastLeaderID = tryLeaderID%n
 				return greply.Value
 			default:
@@ -115,9 +115,9 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				ck.lastLeaderID = tryLeaderID%n
 				return
 			case ErrDuplicate:
-				//DPrintf("************************** FATAL(should rarely see this message) **************************\n")
+				DPrintf("************************** FATAL(should rarely see this message) **************************\n")
 				DPrintf("Client %v PutAppend Error from Server %v: %v with (Key, Value, opType)=(%v, %v, %v) and OpID %v \n", ck.me, tryLeaderID%n, pareply.Err, key, value, op, opID)
-				//DPrintf("************************** FATAL(should rarely see this message) **************************\n")
+				DPrintf("************************** FATAL(should rarely see this message) **************************\n")
 				ck.lastLeaderID = tryLeaderID%n
 				return
 			default:

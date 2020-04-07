@@ -88,38 +88,38 @@ type Raft struct {
 	applyCh                   chan ApplyMsg
 
 	//lab3B
-	lastIncludedIndex int //volatile at the moment, might need to be persistent
-	lastIncludedTerm int
+	lastIncludedIndex int //persistent in snapshot
+	lastIncludedTerm  int //persistent in snapshot
 }
 
 //realIdx: real index of the log
 //logIdx: current index in the logList
 //todo(might cause bugs here): make sure the following functions are executed with locks on raft instance
 func (rf *Raft) getLog(realIdx int) LogEntry {
-	return rf.logList[realIdx-rf.lastIncludedIndex-1];
+	return rf.logList[realIdx-rf.lastIncludedIndex-1]
 }
 
 func (rf *Raft) getRealIdx(logIdx int) int {
-	return logIdx+rf.lastIncludedIndex+1;
+	return logIdx + rf.lastIncludedIndex + 1
 }
 
 func (rf *Raft) getLogIdx(realIdx int) int {
-	return realIdx-rf.lastIncludedIndex-1;
+	return realIdx - rf.lastIncludedIndex - 1
 }
 
 func (rf *Raft) getLastRealIdx() int {
-	return len(rf.logList)-1+rf.lastIncludedIndex+1;
+	return len(rf.logList) - 1 + rf.lastIncludedIndex + 1
 }
 
 func (rf *Raft) getLastTerm() int {
-	if len(rf.logList)==0 {
+	if len(rf.logList) == 0 {
 		return rf.lastIncludedTerm
 	}
 	return rf.logList[len(rf.logList)-1].Term
 }
 
 func (rf *Raft) getRealLogLength() int {
-	return rf.getLastRealIdx()+1
+	return rf.getLastRealIdx() + 1
 }
 
 //
@@ -160,8 +160,22 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logList)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) encodeRaftState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logList)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	data := w.Bytes()
+	return data
 }
 
 //
@@ -189,12 +203,18 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logList []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logList) != nil {
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logList) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("ERROR: Machine %d fails to read from persist data\n", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logList = logList
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		rf.commitIndex = lastIncludedIndex
+		rf.lastApplied = lastIncludedIndex
 	}
 }
 
@@ -217,6 +237,23 @@ type AppendEntryReply struct {
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
+	return ok
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -261,9 +298,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 	isValidCandidate = false
 		// }
 		lastRealIdx := rf.getLastRealIdx()
-		lastRfLog := rf.getLog(lastRealIdx)
-		if args.LastLogTerm < lastRfLog.Term || (args.LastLogTerm == lastRfLog.Term && args.LastLogIndex < lastRealIdx){
-			isValidCandidate = false
+		if lastRealIdx == rf.lastIncludedIndex {
+			if args.LastLogTerm < rf.lastIncludedTerm || (args.LastLogTerm == rf.lastIncludedTerm && args.LastLogIndex < rf.lastIncludedIndex) {
+				isValidCandidate = false
+			}
+		} else {
+			lastRfLog := rf.getLog(lastRealIdx)
+			if args.LastLogTerm < lastRfLog.Term || (args.LastLogTerm == lastRfLog.Term && args.LastLogIndex < lastRealIdx) {
+				isValidCandidate = false
+			}
 		}
 	}
 	if args.Term == rf.currentTerm {
@@ -271,12 +314,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if isValidCandidate && rf.votedFor == -1 {
 			rf.votedFor = args.CandidateID
 			rf.persist()
-			DPrintf("ELECTION VOTE NEWS: candidate machine %v has received vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 			rf.found_leader_or_candidate = true
 		}
 		if rf.votedFor == args.CandidateID {
+			DPrintf("ELECTION VOTE NEWS: candidate machine %v has received vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 			reply.VoteGranted = true
 		} else {
+			DPrintf("ELECTION VOTE NEWS: candidate machine %v has FAILED to receive vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 			reply.VoteGranted = false
 		}
 		return
@@ -290,11 +334,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.found_leader_or_candidate = true
 	}
 	rf.persist()
-	DPrintf("ELECTION VOTE NEWS: candidate machine %v has received vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 	reply.Term = args.Term
 	if rf.votedFor == args.CandidateID {
+		DPrintf("ELECTION VOTE NEWS: candidate machine %v has received vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 		reply.VoteGranted = true
 	} else {
+		DPrintf("ELECTION VOTE NEWS: candidate machine %v has FAILED to receive vote from machine %v for term %d!\n", args.CandidateID, rf.me, rf.currentTerm)
 		reply.VoteGranted = false
 	}
 	return
@@ -397,6 +442,36 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 //
+func (rf *Raft) StartIfSpaceAllow(command interface{}, maxRaftState int) (int, int, bool, bool) {
+	index := -1
+	term := -1
+	isLeader := true
+	isBusy := false
+
+	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != "leader" {
+		isLeader = false
+		return index, term, isLeader, isBusy
+	}
+	if maxRaftState != -1 && rf.GetRaftStateSize() > maxRaftState*8/10 {
+		isBusy = true
+		return index, term, isLeader, isBusy
+	}
+	//leader appends the log and send out appendEntry request to followers
+	DPrintf("*************************************\n")
+	DPrintf("Leader machine %d has received one log{command: %v, writtenTerm: %v} from the client\n", rf.me, command, rf.currentTerm)
+	DPrintf("*************************************\n")
+	rf.logList = append(rf.logList, LogEntry{command, rf.currentTerm})
+	rf.persist()
+	//index = len(rf.logList) //should we put -1 here???
+	index = rf.getRealLogLength()
+	term = rf.currentTerm
+	return index, term, isLeader, isBusy
+}
+
+//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -458,7 +533,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = -1
 	rf.lastIncludedTerm = 0
 
-
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	rf.persist()
@@ -503,7 +577,7 @@ func (rf *Raft) startElectionCampaign() {
 	rf.persist()
 	rf.found_leader_or_candidate = true
 	n := len(rf.peers)
-	rvargs := &RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me, LastLogIndex: len(rf.logList) - 1}
+	rvargs := &RequestVoteArgs{Term: rf.currentTerm, CandidateID: rf.me, LastLogIndex: rf.getLastRealIdx()}
 	// if len(rf.logList) > 0 {
 	// 	rvargs.LastLogTerm = rf.logList[len(rf.logList)-1].Term
 	// }
@@ -551,7 +625,7 @@ func (rf *Raft) startElectionCampaign() {
 }
 
 func (rf *Raft) advertiseLeaderStatus() {
-	magicNumber := 150
+	magicNumber := 100
 	for {
 		rf.mu.Lock()
 		if rf.state != "leader" || rf.dead != 0 {
@@ -568,7 +642,7 @@ func (rf *Raft) advertiseLeaderStatus() {
 				if rf.nextIndex[i] <= rf.lastIncludedIndex {
 					//send snapshot instead for this round of advertisement
 					snapshotNeeded = true
-				}else{
+				} else {
 					snapshotNeeded = false
 				}
 			} else {
@@ -587,9 +661,9 @@ func (rf *Raft) advertiseLeaderStatus() {
 				}
 				//keep filling in AppendEntryArgs
 				if aeargs.PrevLogIndex >= 0 {
-					if(aeargs.PrevLogIndex <= rf.lastIncludedIndex){
+					if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
 						aeargs.PrevLogTerm = rf.lastIncludedTerm
-					}else{
+					} else {
 						aeargs.PrevLogTerm = rf.getLog(aeargs.PrevLogIndex).Term
 					}
 				}
@@ -640,7 +714,7 @@ func (rf *Raft) advertiseLeaderStatus() {
 									if aeargs.PrevLogIndex <= rf.lastIncludedIndex {
 										//need to send snapshot next time
 										rf.nextIndex[peerID] = rf.lastIncludedIndex - 1 //this will guarantee to trigger leader sending snapshot?
-									}else{
+									} else {
 										//aeargs.PrevLogIndex > rf.lastIncludedIndex >= -1
 										curPreIndex := aeargs.PrevLogIndex - 1
 										for curPreIndex > rf.lastIncludedIndex && rf.getLog(curPreIndex).Term >= aeargs.PrevLogTerm {
@@ -648,8 +722,8 @@ func (rf *Raft) advertiseLeaderStatus() {
 										}
 										if curPreIndex <= rf.lastIncludedIndex {
 											rf.nextIndex[peerID] = rf.lastIncludedIndex + 1 //last chance
-										}else{
-											rf.nextIndex[peerID] = curPreIndex + 1;
+										} else {
+											rf.nextIndex[peerID] = curPreIndex + 1
 										}
 									}
 								} else {
@@ -662,13 +736,101 @@ func (rf *Raft) advertiseLeaderStatus() {
 						}
 					}
 				}(i, aeargs)
-			}else{
+			} else {
 				//send snapshot instead
+				DPrintf("Leader machine %d at term %d decides to send install snapshot request to follower machine %d instead\n", rf.me, rf.currentTerm, i)
+				var isargs InstallSnapshotArgs
+				isargs.Term = rf.currentTerm
+				isargs.LeaderID = rf.me
+				isargs.LastIncludedIndex = rf.lastIncludedIndex
+				isargs.LastIncludedTerm = rf.lastIncludedTerm
+				isargs.Data = rf.persister.ReadSnapshot()
+				go func(peerID int, isargs InstallSnapshotArgs) {
+					var isreply InstallSnapshotReply
+					ok := rf.sendInstallSnapshot(peerID, &isargs, &isreply)
+					if ok {
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						if rf.state != "leader" {
+							return
+						}
+						if isreply.Term > rf.currentTerm {
+							rf.currentTerm = isargs.Term
+							rf.state = "follower"
+							rf.votedFor = -1
+							rf.persist()
+							return
+						}
+						if isreply.Term == rf.currentTerm {
+							if rf.matchIndex[peerID] < isargs.LastIncludedIndex {
+								rf.matchIndex[peerID] = isargs.LastIncludedIndex
+							}
+							rf.nextIndex[peerID] = rf.matchIndex[peerID] + 1
+						} else {
+							//do nothing
+						}
+
+					}
+				}(i, isargs)
 			}
 		}
 		rf.mu.Unlock()
 		time.Sleep(time.Duration(magicNumber) * time.Millisecond)
 	}
+}
+
+//
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("INSTALLSNAPSHOT request received from machine %d for follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
+	//step 1
+	if args.Term < rf.currentTerm {
+		DPrintf("INSTALLSNAPSHOT request from machine %d dropped for follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+		DPrintf("ELECTION VOTE RESET: machine %d have updated its current term to %d and can still vote for that term!\n", rf.me, rf.currentTerm)
+	}
+	rf.state = "follower"
+	rf.found_leader_or_candidate = true
+	reply.Term = args.Term
+	//ignore old request
+	if args.LastIncludedIndex < rf.lastIncludedIndex {
+		DPrintf("INSTALLSNAPSHOT: old request from machine %d detected. Follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
+		return
+	}
+
+	//backup: args.LastIncludedIndex + 1 < rf.getRealLogLength() && ((args.LastIncludedIndex == rf.lastIncludedIndex && args.LastIncludedTerm == rf.lastIncludedTerm) || rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm)
+
+	if len(rf.logList) > 0 && rf.getLogIdx(args.LastIncludedIndex) >= 0 && rf.getLogIdx(args.LastIncludedIndex) < len(rf.logList) && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
+		//if existing log entry has same index and term as snapshot's last included entry
+		//retain log entries following it
+		rf.logList = rf.logList[rf.getLogIdx(args.LastIncludedIndex+1):]
+		//do we need to return here immediately, as described by the paper?
+	} else {
+		//discard the entire log
+		rf.logList = make([]LogEntry, 0)
+	}
+	rf.persist()
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+	}
+	if rf.lastApplied < rf.lastIncludedIndex {
+		rf.lastApplied = rf.lastIncludedIndex
+	}
+	rfStates := rf.encodeRaftState()
+	rf.persister.SaveStateAndSnapshot(rfStates, args.Data)
+	if rf.lastApplied > rf.lastIncludedIndex {
+		return
+	}
+	rf.applyCh <- ApplyMsg{CommandIndex: rf.lastIncludedIndex, Command: args.Data, CommandValid: false}
+	DPrintf("INSTALLSNAPSHOT request from machine %d succeed for follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
 }
 
 //
@@ -688,17 +850,21 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.state = "follower"
 	rf.found_leader_or_candidate = true
 	reply.Term = args.Term
-	if args.PrevLogIndex >= 0 && (rf.getRealLogLength() <= args.PrevLogIndex || (args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm) || rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm) {
+	cond1 := rf.getRealLogLength() <= args.PrevLogIndex
+	cond2 := (args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm)
+	//return rf.logList[realIdx-rf.lastIncludedIndex-1]
+	cond3 := (rf.getLogIdx(args.PrevLogIndex) >= 0 && rf.getLogIdx(args.PrevLogIndex) < len(rf.logList) && rf.getLog(args.PrevLogIndex).Term != args.PrevLogTerm)
+	if args.PrevLogIndex >= 0 && (cond1 || cond2 || cond3) {
 		//is it possible that args.PrevLogIndex < rf.lastIncludedIndex?
-		//we have args.PrevLogIndex >= leader.lastIncludedIndex >= rf.lastIncludedIndex guaranteed, 
+		//we have args.PrevLogIndex >= leader.lastIncludedIndex >= rf.lastIncludedIndex guaranteed,
 		//therefore if rf.getLog(args.PrevLogIndex) overflows, then args.PrevLogIndex == rf.lastIncludedIndex
 		DPrintf("APPENDENTRY: machine %d finds a prev log mismatch from leader machine %v at term %d !\n", rf.me, args.LeaderID, rf.currentTerm)
 		DPrintf("PrevLogIndex: %d, Log Real Length: %d\n", args.PrevLogIndex, rf.getRealLogLength())
 		if rf.getRealLogLength() > args.PrevLogIndex {
-			if (args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm) {
+			if args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm {
 				DPrintf("found args.PrevLogIndex == rf.lastIncludedIndex \n")
-				DPrintf("rf.lastIncludedIndex: %d, rf.lastIncludedTerm: %d \n", args.PrevLogTerm, rf.lastIncludedTerm)
-			}else{
+				DPrintf("arg.PrevLogTerm: %d, rf.lastIncludedTerm: %d \n", args.PrevLogTerm, rf.lastIncludedTerm)
+			} else {
 				DPrintf("rf.logList[args.PrevLogIndex].Term: %d, args.Term: %d \n", rf.logList[args.PrevLogIndex].Term, args.Term)
 			}
 		}
@@ -733,7 +899,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		// If args.PrevLogIndex == rf.lastIncludedIndex && args.PrevLogTerm != rf.lastIncludedTerm
 		// 		either 1) matchIndex > rf.lastIncludeIndex -> we find the log with largest index not in snapshot that matches PrevLogTerm
 		//     		or 2) matchIndex = -1 -> we cannot find the log not in snapshot that matches PrevLogTerm, install snapshot is a safe option
-		//     		or 3) matchIndex == rf.lastIncludedIndex 
+		//     		or 3) matchIndex == rf.lastIncludedIndex
 		//				-> either matchIndex log matches PrevLogTerm, or we cannot find the log not in snapshot that matches PrevLogTerm
 		//				-> install snapshot is a safe option, but can do better?
 		if matchIndex == rf.lastIncludedIndex {
@@ -750,17 +916,23 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			//we are guaranteed that args.PrevLogIndex >= leader.lastIncludedIndex >= rf.lastIncludedIndex
 			//therefore if rf.getLog(args.PrevLogIndex+i) overflows, then i=0 and args.PrevLogIndex == rf.lastIncludedIndex
 			//but here i>0, so won't overflow
-			if args.PrevLogIndex+i < rf.getRealLogLength() && (rf.getLog(args.PrevLogIndex+i).Term != args.Entries[i-1].Term) {
+			cond1 := rf.getLogIdx(args.PrevLogIndex+i) >= 0
+			cond2 := rf.getLogIdx(args.PrevLogIndex+i) < len(rf.logList)
+			if args.PrevLogIndex+i < rf.getRealLogLength() && (cond1 && cond2 && rf.getLog(args.PrevLogIndex+i).Term != args.Entries[i-1].Term) {
 				//existing entry conflicts with a new one
 				rf.logList = rf.logList[:rf.getLogIdx(args.PrevLogIndex+i)] //truncate the log
-				break 					//all following logs deleted, no need to loop anymore
+				break                                                       //all following logs deleted, no need to loop anymore
 			}
 		}
 		for i := 1; i <= n; i++ {
-			if args.PrevLogIndex+i < rf.getRealLogLength() {
+			cond1 := rf.getLogIdx(args.PrevLogIndex+i) >= 0
+			cond2 := rf.getLogIdx(args.PrevLogIndex+i) < len(rf.logList)
+			if args.PrevLogIndex+i < rf.getRealLogLength() && cond1 && cond2 {
 				rf.logList[rf.getLogIdx(args.PrevLogIndex+i)] = args.Entries[i-1]
 			} else {
-				rf.logList = append(rf.logList, args.Entries[i-1])
+				if args.PrevLogIndex+i >= rf.getRealLogLength() {
+					rf.logList = append(rf.logList, args.Entries[i-1])
+				}
 			}
 		}
 		// rf.logList = rf.logList[:args.PrevLogIndex+1]
@@ -799,8 +971,8 @@ func (rf *Raft) applyLogs() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//sanity check
-	if rf.commitIndex > rf.getRealLogLength() - 1 {
-		rf.commitIndex = rf.getRealLogLength() - 1 
+	if rf.commitIndex > rf.getRealLogLength()-1 {
+		rf.commitIndex = rf.getRealLogLength() - 1
 	}
 	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 		DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.getLog(i).Command, rf.getLog(i).Term, rf.currentTerm)
@@ -813,4 +985,32 @@ func (rf *Raft) applyLogs() {
 	if rf.lastApplied < rf.commitIndex {
 		rf.lastApplied = rf.commitIndex
 	}
+}
+
+//
+func (rf *Raft) GetRaftStateSize() int {
+	ans := rf.persister.RaftStateSize()
+	return ans
+}
+
+//
+func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if logIdx <= rf.lastIncludedIndex {
+		//old snapshot request, ignore
+		DPrintf("Old snapshot request detected. Ignoring...\n")
+		DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, len(rf.logList))
+		return
+	}
+	DPrintf("machine %d processing snapshot request at term %d \n", rf.me, rf.currentTerm)
+	DPrintf("raft real log length: %d, lastIncludedIndex %d\n", rf.getRealLogLength(), rf.lastIncludedIndex)
+	relativelogIdx := rf.getLogIdx(logIdx)
+	rf.lastIncludedTerm = rf.getLog(logIdx).Term
+	rf.lastIncludedIndex = logIdx
+	
+	rf.logList = rf.logList[relativelogIdx+1:]
+	rf.persist()
+	rfStates := rf.encodeRaftState()
+	rf.persister.SaveStateAndSnapshot(rfStates, serverStates)
 }
