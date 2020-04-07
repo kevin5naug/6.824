@@ -148,7 +148,7 @@ func (kv *KVServer) checkNeedsForSnapshot(logIdx int) {
 	}
 	serverStates := kv.encodeData()
 	DPrintf("Server %d finds snapshot is needed. Going to discard logs with log index up to(including): %d\n", kv.me, logIdx)
-	kv.rf.TakeSnapshot(logIdx, serverStates)
+	go kv.rf.TakeSnapshot(logIdx, serverStates)
 }
 
 //

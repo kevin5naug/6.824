@@ -1085,7 +1085,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		DPrintf("args.LastIncludedIndex: %d, rf.commitIndex: %d \n", args.LastIncludedIndex, rf.commitIndex)
 	}
 	//backup: args.LastIncludedIndex + 1 < rf.getRealLogLength() && ((args.LastIncludedIndex == rf.lastIncludedIndex && args.LastIncludedTerm == rf.lastIncludedTerm) || rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm)
-
+	temp := len(rf.logList)
 	if len(rf.logList) > 0 && rf.getLogIdx(args.LastIncludedIndex) >= 0 && rf.getLogIdx(args.LastIncludedIndex) < len(rf.logList) && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		//if existing log entry has same index and term as snapshot's last included entry
 		//retain log entries following it
@@ -1095,6 +1095,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		//discard the entire log
 		rf.logList = make([]LogEntry, 0)
 	}
+	DPrintf("INSTALLSNAPSHOT LOG LENGTH CHANGES for machine %d from machine %d at term %d: %d -> %d \n", rf.me, args.LeaderID, rf.currentTerm, temp, len(rf.logList))
 	rf.persist()
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
@@ -1290,7 +1291,9 @@ func (rf *Raft) applyLogsThread() {
 		}
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			//DPrintf("COMMITLOG: machine %d is going to commit log index %d: {command %v written term %v} at term %d\n", rf.me, i, rf.logList[i].Command, rf.logList[i].Term, rf.currentTerm)
-			rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
+			if rf.getLog(i).Command != nil {
+				rf.applyCh <- ApplyMsg{CommandIndex: i + 1, Command: rf.getLog(i).Command, CommandValid: true}
+			}
 		}
 		//just make sure we are not going back, maybe not needed?
 		if rf.lastApplied < rf.commitIndex {
@@ -1326,8 +1329,9 @@ func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 	}
 	rf.lastIncludedTerm = rf.getLog(logIdx).Term
 	rf.lastIncludedIndex = logIdx
-
+	temp:= len(rf.logList)
 	rf.logList = rf.logList[relativelogIdx+1:]
+	DPrintf("TAKESNAPSHOT LOG LENGTH CHANGES for machine %d at term %d: %d -> %d \n", rf.me, rf.currentTerm, temp, len(rf.logList))
 	curRealLogLength := rf.getRealLogLength()
 	if prevRealLogLength != curRealLogLength {
 		DPrintf("FATAL after snapshot, machine %d prevRealLogLength %d != curRealLogLength %d\n", rf.me, prevRealLogLength, curRealLogLength)
