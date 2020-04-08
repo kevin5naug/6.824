@@ -13,7 +13,7 @@ import (
 )
 
 //
-const Debug = 1
+const Debug = 0
 
 //
 func DPrintf(format string, a ...interface{}) (n int, err error) {
@@ -164,9 +164,14 @@ func (kv *KVServer) setSnapshotData(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var database map[string]string
-	var lastServiceRecord map[int64]int //clientID to opID
-	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil {
+	var lastServiceRecord map[int64]int
+	if d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&database) != nil ||
+		d.Decode(&lastServiceRecord) != nil {
 		DPrintf("ERROR: Server %d fails to read from persist data\n", kv.me)
 	} else {
 		kv.Database = database
@@ -229,6 +234,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case op := <-ch:
 		//op is committed and applied before timeout
 		if command.Mode == op.Mode && command.Key == op.Key && command.OpID == op.OpID && command.ClientID == op.ClientID {
+			DPrintf("Server %d successfully served ClientID: %v 's Get request : (key: %v, value: %v, OpID: %v)... \n", kv.me, args.ClientID, args.Key, op.Value, args.OpID)
 			reply.Value = op.Value
 			reply.Err = OK
 			return
@@ -296,6 +302,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case op := <-ch:
 		//op is committed and applied before timeout
 		if command.Mode == op.Mode && command.Key == op.Key && command.Value == op.Value && command.OpID == op.OpID && command.ClientID == op.ClientID {
+			DPrintf("Server %d successfully served ClientID: %v 's PutAppend request : (key: %v, value: %v, OpID: %v)... \n", kv.me, args.ClientID, args.Key, args.Value, args.OpID)
 			reply.Err = OK
 			return
 		}

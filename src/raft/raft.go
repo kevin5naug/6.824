@@ -161,8 +161,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logList)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -173,10 +171,32 @@ func (rf *Raft) encodeRaftState() []byte {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logList)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 	return data
+}
+
+func (rf *Raft) unpackAndGenerateSnapshot(kvState []byte) (raftPacked []byte, snapshot []byte) {
+	r := bytes.NewBuffer(kvState)
+	d := labgob.NewDecoder(r)
+	var database map[string]string
+	var lastServiceRecord map[int64]int //clientID to opID
+	if d.Decode(&database) != nil || d.Decode(&lastServiceRecord) != nil {
+		DPrintf("TAKESNAPSHOT ERROR: Machine %d fails to read from passed in kvstate data\n")
+	}
+	w1 := new(bytes.Buffer)
+	e1 := labgob.NewEncoder(w1)
+	e1.Encode(rf.currentTerm)
+	e1.Encode(rf.votedFor)
+	e1.Encode(rf.logList)
+	raftPacked = w1.Bytes()
+	w2 := new(bytes.Buffer)
+	e2 := labgob.NewEncoder(w2)
+	e2.Encode(rf.lastIncludedIndex)
+	e2.Encode(rf.lastIncludedTerm)
+	e2.Encode(database)
+	e2.Encode(lastServiceRecord)
+	snapshot = w2.Bytes()
+	return raftPacked, snapshot
 }
 
 //
@@ -205,18 +225,47 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logList []LogEntry
-	var lastIncludedIndex int
-	var lastIncludedTerm int
-	if d.Decode(&currentTerm) != nil || 
-	d.Decode(&votedFor) != nil || 
-	d.Decode(&logList) != nil || 
-	d.Decode(&lastIncludedIndex) != nil || 
-	d.Decode(&lastIncludedTerm) != nil {
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logList) != nil {
 		DPrintf("ERROR: Machine %d fails to read from persist data\n", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logList = logList
+	}
+}
+
+func (rf *Raft) setSnapshotData(data []byte) {
+	DPrintf("RESTART: Machine %d is reading from its persisted file\n", rf.me)
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := labgob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   rf.xxx = xxx
+	//   rf.yyy = yyy
+	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	var database map[string]string
+	var lastServiceRecord map[int64]int
+	if d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
+		d.Decode(&database) != nil ||
+		d.Decode(&lastServiceRecord) != nil {
+		DPrintf("ERROR: Machine %d fails to read from persist data\n", rf.me)
+	} else {
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.commitIndex = lastIncludedIndex
@@ -805,6 +854,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.setSnapshotData(persister.ReadSnapshot())
 	rf.persist()
 	go rf.handleTimeOut()
 	go rf.applyLogsThread()
@@ -1102,7 +1152,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.logList = make([]LogEntry, 0)
 	}
 	DPrintf("INSTALLSNAPSHOT LOG LENGTH CHANGES for machine %d from machine %d at term %d: %d -> %d \n", rf.me, args.LeaderID, rf.currentTerm, temp, len(rf.logList))
-	rf.persist()
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	if rf.commitIndex < rf.lastIncludedIndex {
@@ -1351,7 +1400,6 @@ func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 		DPrintf("FATAL after TakeSnapshot, machine %d prevRealLogLength %d != curRealLogLength %d\n", rf.me, prevRealLogLength, curRealLogLength)
 		//log.Fatalf("Aborting TakeSnapshot...")
 	}
-	rf.persist()
-	rfStates := rf.encodeRaftState()
-	rf.persister.SaveStateAndSnapshot(rfStates, serverStates)
+	rfPacked, snapshot := rf.unpackAndGenerateSnapshot(serverStates)
+	rf.persister.SaveStateAndSnapshot(rfPacked, snapshot)
 }
