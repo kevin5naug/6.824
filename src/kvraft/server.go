@@ -47,10 +47,6 @@ type KVServer struct {
 	Database          map[string]string
 	LastServiceRecord map[int64]int //clientID to opID
 	PendingOps        map[int]chan Op
-	// reason why we need to cache and when we use it:
-	// client 1 sends a get request, server accepts it and has added it to the log
-	// but the request gets timed out before server send the get results to PendingOps,
-	// and after server executed the get request
 }
 
 //
@@ -80,7 +76,7 @@ func (kv *KVServer) MonitorAndApplyPendingOps() {
 				serverData := logEntry.Command.([]byte)
 				kv.mu.Lock()
 				kv.setSnapshotData(serverData)
-				DPrintf("RESET STATE: server %d has reset its state\n", kv.me)
+				DPrintf("RESET STATE: server %d(raft %d) has reset its state\n", kv.me)
 				kv.mu.Unlock()
 				continue
 			}

@@ -207,7 +207,11 @@ func (rf *Raft) readPersist(data []byte) {
 	var logList []LogEntry
 	var lastIncludedIndex int
 	var lastIncludedTerm int
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logList) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
+	if d.Decode(&currentTerm) != nil || 
+	d.Decode(&votedFor) != nil || 
+	d.Decode(&logList) != nil || 
+	d.Decode(&lastIncludedIndex) != nil || 
+	d.Decode(&lastIncludedTerm) != nil {
 		DPrintf("ERROR: Machine %d fails to read from persist data\n", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
@@ -1083,9 +1087,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex <= rf.commitIndex {
 		DPrintf("INSTALLSNAPSHOT snapshot info not useful:  request from machine %d detected. Follower machine %d at term %d!\n", args.LeaderID, rf.me, rf.currentTerm)
 		DPrintf("args.LastIncludedIndex: %d, rf.commitIndex: %d \n", args.LastIncludedIndex, rf.commitIndex)
+		return
 	}
 	//backup: args.LastIncludedIndex + 1 < rf.getRealLogLength() && ((args.LastIncludedIndex == rf.lastIncludedIndex && args.LastIncludedTerm == rf.lastIncludedTerm) || rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm)
 	temp := len(rf.logList)
+	prevRealLogLength := rf.getRealLogLength()
 	if len(rf.logList) > 0 && rf.getLogIdx(args.LastIncludedIndex) >= 0 && rf.getLogIdx(args.LastIncludedIndex) < len(rf.logList) && rf.getLog(args.LastIncludedIndex).Term == args.LastIncludedTerm {
 		//if existing log entry has same index and term as snapshot's last included entry
 		//retain log entries following it
@@ -1101,12 +1107,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	if rf.commitIndex < rf.lastIncludedIndex {
 		rf.commitIndex = rf.lastIncludedIndex
+		rf.applyCond.Signal()
 	}
 	if rf.lastApplied < rf.lastIncludedIndex {
 		rf.lastApplied = rf.lastIncludedIndex
 	}
 	rfStates := rf.encodeRaftState()
 	rf.persister.SaveStateAndSnapshot(rfStates, args.Data)
+	curRealLogLength := rf.getRealLogLength()
+	if prevRealLogLength > curRealLogLength {
+		DPrintf("FATAL after InstallSnapshot from leader machine %d, machine %d prevRealLogLength %d > curRealLogLength %d\n", args.LeaderID, rf.me, prevRealLogLength, curRealLogLength)
+		//log.Fatalf("Aborting InstallSnapshot...")
+	}
 	if rf.lastApplied > rf.lastIncludedIndex {
 		return
 	}
@@ -1319,22 +1331,25 @@ func (rf *Raft) TakeSnapshot(logIdx int, serverStates []byte) {
 		//DPrintf("logIdx: %d, rf.lastIncludedIndex: %d, rf.commitIndex %d, current log length: %d\n", logIdx, rf.lastIncludedIndex, rf.commitIndex, len(rf.logList))
 		return
 	}
-	DPrintf("machine %d processing snapshot request at term %d. raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.me, rf.currentTerm, rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
-	//DPrintf("raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
-
 	prevRealLogLength := rf.getRealLogLength()
 	relativelogIdx := rf.getLogIdx(logIdx)
 	if relativelogIdx < 0 || relativelogIdx >= len(rf.logList) {
-		DPrintf("FATAL failure incoming for machine %d processing snapshot: relativelogIdx %d, len(rf.logList): %d \n", rf.me, relativelogIdx, len(rf.logList))
+		DPrintf("FATAL failure incoming for machine %d processing snapshot, Aborting...: relativelogIdx %d, len(rf.logList): %d \n", rf.me, relativelogIdx, len(rf.logList))
+		//log.Fatalf("Aborting TakeSnapshot...")
+		return
 	}
+
+	DPrintf("machine %d processing snapshot request at term %d. raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.me, rf.currentTerm, rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
+	//DPrintf("raft real log length: %d, lastIncludedIndex %d, passed-in logIdx: %d \n", rf.getRealLogLength(), rf.lastIncludedIndex, logIdx)
 	rf.lastIncludedTerm = rf.getLog(logIdx).Term
 	rf.lastIncludedIndex = logIdx
-	temp:= len(rf.logList)
+	temp := len(rf.logList)
 	rf.logList = rf.logList[relativelogIdx+1:]
 	DPrintf("TAKESNAPSHOT LOG LENGTH CHANGES for machine %d at term %d: %d -> %d \n", rf.me, rf.currentTerm, temp, len(rf.logList))
 	curRealLogLength := rf.getRealLogLength()
 	if prevRealLogLength != curRealLogLength {
-		DPrintf("FATAL after snapshot, machine %d prevRealLogLength %d != curRealLogLength %d\n", rf.me, prevRealLogLength, curRealLogLength)
+		DPrintf("FATAL after TakeSnapshot, machine %d prevRealLogLength %d != curRealLogLength %d\n", rf.me, prevRealLogLength, curRealLogLength)
+		//log.Fatalf("Aborting TakeSnapshot...")
 	}
 	rf.persist()
 	rfStates := rf.encodeRaftState()
